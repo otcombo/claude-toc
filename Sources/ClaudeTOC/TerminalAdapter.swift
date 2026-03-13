@@ -1,0 +1,263 @@
+import AppKit
+import Foundation
+
+let logFile = "/tmp/claude-toc.log"
+
+func log(_ msg: String) {
+    let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(msg)\n"
+    fputs(line, stderr)
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: logFile) {
+            let handle = FileHandle(forWritingAtPath: logFile)!
+            handle.seekToEndOfFile()
+            handle.write(data)
+            handle.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: logFile, contents: data)
+        }
+    }
+}
+
+enum TerminalType: String, Sendable {
+    case kitty = "net.kovidgoyal.kitty"
+    case iterm2 = "com.googlecode.iterm2"
+    case terminalApp = "com.apple.Terminal"
+    case warp = "dev.warp.Warp-Stable"
+    case alacritty = "org.alacritty"
+    case termius = "com.termius-dmg.mac"
+    case unknown = "unknown"
+}
+
+@MainActor
+enum TerminalAdapter {
+
+    static func detectTerminal(hookPid: Int32? = nil) -> (TerminalType, NSRunningApplication?) {
+        let knownBundleIds: [String: TerminalType] = [
+            "net.kovidgoyal.kitty": .kitty,
+            "com.googlecode.iterm2": .iterm2,
+            "com.apple.Terminal": .terminalApp,
+            "dev.warp.Warp-Stable": .warp,
+            "org.alacritty": .alacritty,
+            "com.termius-dmg.mac": .termius,
+        ]
+
+        let runningApps = NSWorkspace.shared.runningApplications
+        var pidToApp: [Int32: NSRunningApplication] = [:]
+        for app in runningApps {
+            pidToApp[app.processIdentifier] = app
+        }
+
+        if let startPid = hookPid {
+            log("detectTerminal: walking process tree from pid \(startPid)")
+            var currentPid = startPid
+            var visited = Set<Int32>()
+            while currentPid > 1 && !visited.contains(currentPid) {
+                visited.insert(currentPid)
+                log("  checking pid \(currentPid)")
+                if let app = pidToApp[currentPid],
+                   let bundleId = app.bundleIdentifier,
+                   let termType = knownBundleIds[bundleId] {
+                    log("  → found terminal: \(bundleId) at pid \(currentPid)")
+                    return (termType, app)
+                }
+                currentPid = getParentPid(currentPid)
+            }
+            log("detectTerminal: no terminal found in process tree")
+        }
+
+        for app in runningApps {
+            if let bundleId = app.bundleIdentifier,
+               let termType = knownBundleIds[bundleId],
+               app.isActive || app.ownsMenuBar {
+                log("detectTerminal: fallback found active terminal \(bundleId)")
+                return (termType, app)
+            }
+        }
+
+        for app in runningApps {
+            if let bundleId = app.bundleIdentifier,
+               let termType = knownBundleIds[bundleId] {
+                log("detectTerminal: fallback found running terminal \(bundleId)")
+                return (termType, app)
+            }
+        }
+
+        log("detectTerminal: no known terminal found")
+        return (.unknown, nil)
+    }
+
+    private static func getParentPid(_ pid: Int32) -> Int32 {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        let result = sysctl(&mib, 4, &info, &size, nil, 0)
+        if result == 0 {
+            return info.kp_eproc.e_ppid
+        }
+        return 0
+    }
+
+    static func estimateColumns(app: NSRunningApplication?) -> Int {
+        guard let app = app else { return 80 }
+        let pid = app.processIdentifier
+        let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        for windowInfo in windowList {
+            guard let ownerPID = windowInfo[kCGWindowOwnerPID as String] as? Int32,
+                  ownerPID == pid,
+                  let bounds = windowInfo[kCGWindowBounds as String] as? [String: CGFloat],
+                  let w = bounds["Width"],
+                  w > 100 else { continue }
+            let effectiveWidth = w - 40
+            let columns = Int(effectiveWidth / 7.2)
+            log("estimateColumns: windowWidth=\(w), columns=\(columns)")
+            return max(40, min(columns, 200))
+        }
+        return 80
+    }
+
+    static func activateTerminal(_ app: NSRunningApplication) {
+        log("activateTerminal: \(app.bundleIdentifier ?? "unknown") pid=\(app.processIdentifier)")
+        let result = app.activate()
+        log("activateTerminal result: \(result)")
+    }
+
+    /// Jump to heading by scrolling the terminal via Accessibility API
+    static func jumpToHeading(
+        heading: TOCHeading,
+        responseTerminalLines: Int,
+        app: NSRunningApplication
+    ) {
+        let pid = app.processIdentifier
+        log("jumpToHeading: '\(heading.title)' estLine=\(heading.estimatedTerminalLine) responseLines=\(responseTerminalLines) pid=\(pid)")
+
+        // Activate terminal
+        activateTerminal(app)
+
+        // Walk AX hierarchy: App → Window → ... → ScrollArea → TextArea + ScrollBar
+        let axApp = AXUIElementCreateApplication(pid)
+
+        // Get focused window (or fall back to first window)
+        var windowRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &windowRef) != .success {
+            log("jumpToHeading: failed to get focused window, trying windows list")
+            var windowsRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+                  let windows = windowsRef as? [AXUIElement],
+                  let firstWindow = windows.first else {
+                log("jumpToHeading: no windows found")
+                return
+            }
+            windowRef = firstWindow
+        }
+        let window = windowRef as! AXUIElement
+
+        // Find the AXScrollArea recursively
+        guard let scrollArea = findAXElement(in: window, role: kAXScrollAreaRole as String) else {
+            log("jumpToHeading: no AXScrollArea found")
+            return
+        }
+
+        // Get the AXTextArea inside the scroll area
+        guard let textArea = findAXElement(in: scrollArea, role: kAXTextAreaRole as String) else {
+            log("jumpToHeading: no AXTextArea found")
+            return
+        }
+
+        // Get cursor line number (≈ total lines, since Claude just finished responding)
+        var cursorLineRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(textArea, kAXInsertionPointLineNumberAttribute as CFString, &cursorLineRef) == .success,
+              let cursorLine = (cursorLineRef as? NSNumber)?.intValue else {
+            log("jumpToHeading: failed to get AXInsertionPointLineNumber")
+            return
+        }
+        log("jumpToHeading: cursorLine (total lines) = \(cursorLine)")
+
+        // Get visible character range to determine visible rows
+        var visRangeRef: CFTypeRef?
+        var visibleRows = 40 // fallback
+        if AXUIElementCopyAttributeValue(textArea, kAXVisibleCharacterRangeAttribute as CFString, &visRangeRef) == .success {
+            let visRange = visRangeRef as! AXValue
+            var cfRange = CFRange(location: 0, length: 0)
+            AXValueGetValue(visRange, .cfRange, &cfRange)
+            log("jumpToHeading: visibleCharRange location=\(cfRange.location) length=\(cfRange.length)")
+
+            // Use parameterized attribute to get line number for start and end of visible range
+            let startIndex = cfRange.location
+            let endIndex = cfRange.location + cfRange.length - 1
+
+            var startLineRef: CFTypeRef?
+            var endLineRef: CFTypeRef?
+            if AXUIElementCopyParameterizedAttributeValue(textArea, kAXLineForIndexParameterizedAttribute as CFString, NSNumber(value: startIndex) as CFTypeRef, &startLineRef) == .success,
+               AXUIElementCopyParameterizedAttributeValue(textArea, kAXLineForIndexParameterizedAttribute as CFString, NSNumber(value: max(0, endIndex)) as CFTypeRef, &endLineRef) == .success,
+               let startLine = (startLineRef as? NSNumber)?.intValue,
+               let endLine = (endLineRef as? NSNumber)?.intValue {
+                visibleRows = max(endLine - startLine, 1)
+                log("jumpToHeading: visibleRows = \(visibleRows) (lines \(startLine)...\(endLine))")
+            }
+        }
+
+        // Calculate target absolute line
+        // After Claude responds, the terminal shows:
+        //   [response content]     ← responseTerminalLines lines
+        //   ─────────────────      ← separator
+        //   › [cursor]             ← prompt (AXInsertionPointLineNumber points here)
+        //   ─────────────────      ← separator
+        //   ? for shortcuts        ← help hint
+        // So cursor is ~4 lines below the response end
+        let claudeUIChrome = 4
+        let responseEndLine = cursorLine - claudeUIChrome
+        let headingAbsLine = responseEndLine - responseTerminalLines + heading.estimatedTerminalLine
+        log("jumpToHeading: responseEndLine=\(responseEndLine) headingAbsLine=\(headingAbsLine)")
+
+        // Scroll bar value: proportion of scroll position
+        // value = firstVisibleLine / (totalLines - visibleRows)
+        // We want heading at top of viewport, so firstVisibleLine = headingAbsLine
+        let maxScrollLine = cursorLine - visibleRows
+        guard maxScrollLine > 0 else {
+            log("jumpToHeading: content fits in viewport, no scroll needed")
+            return
+        }
+
+        let scrollValue = Float(max(0, headingAbsLine)) / Float(maxScrollLine)
+        let clampedValue = min(max(scrollValue, 0.0), 1.0)
+        log("jumpToHeading: scrollValue = \(headingAbsLine) / \(maxScrollLine) = \(scrollValue) → clamped \(clampedValue)")
+
+        // Get the vertical scroll bar
+        var scrollBarRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(scrollArea, kAXVerticalScrollBarAttribute as CFString, &scrollBarRef) == .success else {
+            log("jumpToHeading: no vertical scroll bar found")
+            return
+        }
+        let scrollBar = scrollBarRef as! AXUIElement
+
+        // Set the scroll position
+        let result = AXUIElementSetAttributeValue(scrollBar, kAXValueAttribute as CFString, NSNumber(value: clampedValue) as CFTypeRef)
+        log("jumpToHeading: set scroll bar to \(clampedValue), result = \(result == .success ? "success" : "failed (\(result.rawValue))")")
+    }
+
+    // MARK: - AX helpers
+
+    /// Recursively find an AXUIElement with the given role
+    private static func findAXElement(in element: AXUIElement, role targetRole: String, depth: Int = 0) -> AXUIElement? {
+        guard depth < 10 else { return nil }
+
+        var roleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+           let role = roleRef as? String, role == targetRole {
+            return element
+        }
+
+        var childrenRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+              let children = childrenRef as? [AXUIElement] else {
+            return nil
+        }
+
+        for child in children {
+            if let found = findAXElement(in: child, role: targetRole, depth: depth + 1) {
+                return found
+            }
+        }
+        return nil
+    }
+}
