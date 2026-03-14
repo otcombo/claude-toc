@@ -1,65 +1,62 @@
 import AppKit
 import Foundation
 
+// Parse args before NSApplication starts
+var transcriptPath: String?
+var hookPid: Int32?
+
+let cliArgs = Array(CommandLine.arguments.dropFirst())
+var positional: [String] = []
+var argIdx = 0
+while argIdx < cliArgs.count {
+    if cliArgs[argIdx] == "--hook-pid", argIdx + 1 < cliArgs.count {
+        hookPid = Int32(cliArgs[argIdx + 1])
+        argIdx += 2
+    } else {
+        positional.append(cliArgs[argIdx])
+        argIdx += 1
+    }
+}
+
+if let first = positional.first {
+    transcriptPath = first
+}
+
+// Try sending to a running instance BEFORE starting NSApplication
+if let path = transcriptPath {
+    let msg = IPCMessage(transcriptPath: path, hookPid: hookPid)
+    if SocketClient.send(message: msg) {
+        // Successfully sent to running instance — just exit
+        exit(0)
+    }
+}
+
+// We are the main instance
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
-    let controller = TOCWindowController()
+    let sessionManager = TOCSessionManager()
+    let menuBar = MenuBarController()
+    var socketServer: SocketServer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        var transcriptPath: String?
-        var hookPid: Int32?
+        log("Starting as main instance")
 
-        let args = Array(CommandLine.arguments.dropFirst())
-        var positional: [String] = []
-        var i = 0
-        while i < args.count {
-            if args[i] == "--hook-pid", i + 1 < args.count {
-                hookPid = Int32(args[i + 1])
-                i += 2
-            } else {
-                positional.append(args[i])
-                i += 1
+        sessionManager.onSessionsChanged = { [weak self] in
+            self?.menuBar.updateMenu()
+        }
+        menuBar.setup(sessionManager: sessionManager)
+
+        socketServer = SocketServer { [weak self] msg in
+            DispatchQueue.main.async {
+                self?.sessionManager.addSession(transcriptPath: msg.transcriptPath, hookPid: msg.hookPid)
             }
         }
+        socketServer?.start()
 
-        if let first = positional.first {
-            transcriptPath = first
-        } else {
-            let stdinData = FileHandle.standardInput.readDataToEndOfFile()
-            if !stdinData.isEmpty,
-               let json = try? JSONSerialization.jsonObject(with: stdinData) as? [String: Any],
-               let path = json["transcript_path"] as? String {
-                transcriptPath = path
-            }
+        // Handle the initial transcript that started us
+        if let path = transcriptPath {
+            sessionManager.addSession(transcriptPath: path, hookPid: hookPid)
         }
-
-        guard let path = transcriptPath else {
-            fputs("Usage: claude-toc <transcript-path> [--hook-pid PID]\n", stderr)
-            NSApplication.shared.terminate(nil)
-            return
-        }
-
-        // Detect terminal first so we can estimate column width
-        let (terminalType, terminalApp) = TerminalAdapter.detectTerminal(hookPid: hookPid)
-        log("Detected terminal: \(terminalType.rawValue), pid: \(terminalApp?.processIdentifier ?? -1)")
-
-        let termColumns = TerminalAdapter.estimateColumns(app: terminalApp)
-        log("Estimated terminal columns: \(termColumns)")
-
-        guard let tocResult = TOCParser.parse(transcriptPath: path, terminalColumns: termColumns) else {
-            fputs("Failed to parse transcript.\n", stderr)
-            NSApplication.shared.terminate(nil)
-            return
-        }
-
-        if tocResult.headings.isEmpty {
-            log("No headings found, exiting.")
-            NSApplication.shared.terminate(nil)
-            return
-        }
-
-        log("Found \(tocResult.headings.count) headings, \(tocResult.totalLines) md lines -> \(tocResult.estimatedTerminalLines) terminal lines")
-
-        controller.show(tocResult: tocResult, terminalType: terminalType, terminalApp: terminalApp)
     }
 }
 

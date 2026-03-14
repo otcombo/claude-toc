@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+@preconcurrency import UserNotifications
 
 /// A floating panel that doesn't steal focus from the terminal
 class TOCPanel: NSPanel {
@@ -28,85 +29,208 @@ class TOCPanel: NSPanel {
     }
 }
 
+/// Represents one Claude Code session with its TOC panel
 @MainActor
-class TOCWindowController {
-    private var panel: TOCPanel?
-    private var tocResult: TOCResult?
-    private var terminalType: TerminalType = .unknown
-    private var terminalApp: NSRunningApplication?
+class TOCSession {
+    let id: String               // transcript filename (UUID)
+    let transcriptPath: String
+    let projectName: String?
+    let tocResult: TOCResult?
+    let terminalType: TerminalType
+    let terminalApp: NSRunningApplication?
+    var panel: TOCPanel?
 
-    func show(tocResult: TOCResult, terminalType: TerminalType, terminalApp: NSRunningApplication?) {
+    init(id: String, transcriptPath: String, projectName: String?, tocResult: TOCResult?,
+         terminalType: TerminalType, terminalApp: NSRunningApplication?) {
+        self.id = id
+        self.transcriptPath = transcriptPath
+        self.projectName = projectName
         self.tocResult = tocResult
         self.terminalType = terminalType
         self.terminalApp = terminalApp
+    }
 
-        panel?.close()
+    var menuTitle: String {
+        var title = projectName ?? "Session"
+        if let q = tocResult?.lastUserQuery {
+            let trimmed = q.replacingOccurrences(of: "\n", with: " ")
+            let maxLen = 30
+            if trimmed.count > maxLen {
+                title += " — \"\(trimmed.prefix(maxLen))…\""
+            } else {
+                title += " — \"\(trimmed)\""
+            }
+        }
+        return title
+    }
+}
 
-        guard !tocResult.headings.isEmpty else {
-            log("show: no headings, skipping")
-            return
+/// Manages multiple TOC sessions (one per Claude Code window)
+@MainActor
+class TOCSessionManager {
+    private var sessions: [String: TOCSession] = [:]
+    var onSessionsChanged: (() -> Void)?
+
+    var activeSessions: [TOCSession] {
+        Array(sessions.values).sorted { $0.id < $1.id }
+    }
+
+    func addSession(transcriptPath: String, hookPid: Int32?) {
+        let sessionId = URL(fileURLWithPath: transcriptPath).deletingPathExtension().lastPathComponent
+        let projectName = Self.extractProjectName(from: transcriptPath)
+
+        log("SessionManager: adding session \(sessionId), project: \(projectName ?? "unknown")")
+
+        // Detect terminal
+        let (terminalType, terminalApp) = TerminalAdapter.detectTerminal(hookPid: hookPid)
+        let termColumns = TerminalAdapter.estimateColumns(app: terminalApp)
+
+        let tocResult = TOCParser.parse(transcriptPath: transcriptPath, terminalColumns: termColumns)
+
+        log("SessionManager: headings=\(tocResult?.headings.count ?? 0), query: \(tocResult?.lastUserQuery?.prefix(40) ?? "nil")")
+
+        // Close existing panel for this session
+        sessions[sessionId]?.panel?.close()
+
+        let session = TOCSession(
+            id: sessionId, transcriptPath: transcriptPath, projectName: projectName,
+            tocResult: tocResult, terminalType: terminalType, terminalApp: terminalApp
+        )
+
+        // Show TOC panel only if there are headings
+        if let toc = tocResult, !toc.headings.isEmpty {
+            showPanel(for: session)
         }
 
+        sessions[sessionId] = session
+        log("SessionManager: session \(sessionId) active, total sessions: \(sessions.count)")
+
+        // Always send notification
+        sendNotification(for: session)
+
+        onSessionsChanged?()
+    }
+
+    func closeAll() {
+        for session in sessions.values {
+            session.panel?.close()
+            session.panel = nil
+        }
+        sessions.removeAll()
+        onSessionsChanged?()
+    }
+
+    func closeSession(id: String) {
+        sessions[id]?.panel?.close()
+        sessions.removeValue(forKey: id)
+        onSessionsChanged?()
+    }
+
+    func focusSession(id: String) {
+        guard let session = sessions[id] else { return }
+        if let panel = session.panel {
+            panel.orderFrontRegardless()
+        }
+        // Also activate the terminal
+        session.terminalApp?.activate()
+    }
+
+    // MARK: - Panel creation
+
+    private func showPanel(for session: TOCSession) {
+        guard let tocResult = session.tocResult else { return }
         let rowHeight: CGFloat = 28
         let headerHeight: CGFloat = 40
         let contentHeight = min(CGFloat(tocResult.headings.count) * rowHeight + headerHeight, 400)
         let panelWidth: CGFloat = 260
 
-        // Find terminal window position via CGWindowList
-        let panelOrigin = findTerminalTopRight(terminalApp: terminalApp, panelWidth: panelWidth, panelHeight: contentHeight)
-
+        let panelOrigin = findTerminalTopRight(
+            terminalApp: session.terminalApp, panelWidth: panelWidth, panelHeight: contentHeight)
         let panelRect = NSRect(x: panelOrigin.x, y: panelOrigin.y, width: panelWidth, height: contentHeight)
-        log("show: panelRect = \(panelRect)")
 
         let newPanel = TOCPanel(contentRect: panelRect)
+        let sessionId = session.id
 
         let hostingView = NSHostingView(rootView: TOCView(
             headings: tocResult.headings,
             totalLines: tocResult.totalLines,
             onHeadingClick: { [weak self] heading in
-                self?.handleHeadingClick(heading)
+                self?.handleHeadingClick(heading, sessionId: sessionId)
             },
             onDismiss: { [weak self] in
-                self?.dismiss()
+                self?.closeSession(id: sessionId)
             }
         ))
 
         newPanel.contentView = hostingView
         newPanel.orderFrontRegardless()
-
-        self.panel = newPanel
-
-        sendNotification(
-            title: "Claude responded",
-            body: "\(tocResult.headings.count) sections"
-        )
+        session.panel = newPanel
     }
 
-    func dismiss() {
-        panel?.close()
-        panel = nil
-        NSApplication.shared.terminate(nil)
-    }
-
-    private func handleHeadingClick(_ heading: TOCHeading) {
-        log("handleHeadingClick: '\(heading.title)' level=\(heading.level)")
-        guard let termApp = terminalApp,
-              let toc = tocResult else {
-            log("handleHeadingClick: missing terminalApp or tocResult")
-            return
-        }
-
+    private func handleHeadingClick(_ heading: TOCHeading, sessionId: String) {
+        guard let session = sessions[sessionId],
+              let tocResult = session.tocResult,
+              let termApp = session.terminalApp else { return }
         TerminalAdapter.jumpToHeading(
             heading: heading,
-            responseTerminalLines: toc.estimatedTerminalLines,
+            responseTerminalLines: tocResult.estimatedTerminalLines,
             app: termApp
         )
     }
 
-    /// Find the top-right corner of the terminal window and return NSWindow origin for our panel
+    // MARK: - Notification
+
+    private func sendNotification(for session: TOCSession) {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = NotificationClickHandler.shared
+
+        // Title: Claude responded "user query"
+        let querySnippet: String
+        if let q = session.tocResult?.lastUserQuery {
+            let maxLen = 40
+            let trimmed = q.replacingOccurrences(of: "\n", with: " ")
+            if trimmed.count <= maxLen {
+                querySnippet = " \"\(trimmed)\""
+            } else {
+                querySnippet = " \"\(trimmed.prefix(maxLen))…\""
+            }
+        } else {
+            querySnippet = ""
+        }
+        let notifTitle = "Claude responded\(querySnippet)"
+        let notifBody = session.tocResult?.responsePreview ?? "New response"
+
+        log("sendNotification: requesting authorization...")
+        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+            log("sendNotification: authorization granted=\(granted), error=\(error?.localizedDescription ?? "nil")")
+            if granted {
+                let content = UNMutableNotificationContent()
+                content.title = notifTitle
+                content.body = notifBody
+                if let bundleID = session.terminalApp?.bundleIdentifier {
+                    content.userInfo = ["terminalBundleID": bundleID]
+                }
+                let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+                center.add(request) { addError in
+                    log("sendNotification: add result error=\(addError?.localizedDescription ?? "nil")")
+                }
+            } else {
+                // Fallback to osascript when UNUserNotification is not authorized
+                let escapedTitle = notifTitle.replacingOccurrences(of: "\"", with: "\\\"")
+                let escapedBody = notifBody.replacingOccurrences(of: "\"", with: "\\\"")
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                process.arguments = ["-e", "display notification \"\(escapedBody)\" with title \"\(escapedTitle)\""]
+                try? process.run()
+                log("sendNotification: used osascript fallback")
+            }
+        }
+    }
+
+    // MARK: - Positioning
+
     private func findTerminalTopRight(terminalApp: NSRunningApplication?, panelWidth: CGFloat, panelHeight: CGFloat) -> NSPoint {
         guard let termApp = terminalApp else {
-            log("findTerminalTopRight: no terminal app, using main screen")
             return fallbackPosition(panelWidth: panelWidth, panelHeight: panelHeight)
         }
 
@@ -119,34 +243,17 @@ class TOCWindowController {
                   let bounds = windowInfo[kCGWindowBounds as String] as? [String: CGFloat],
                   let cgX = bounds["X"], let cgY = bounds["Y"],
                   let cgW = bounds["Width"], let cgH = bounds["Height"],
-                  cgW > 100, cgH > 100 else { // skip tiny windows (menus, etc)
+                  cgW > 100, cgH > 100 else {
                 continue
             }
 
-            log("findTerminalTopRight: terminal CG bounds x=\(cgX) y=\(cgY) w=\(cgW) h=\(cgH)")
-
-            // Log all screens for debugging
-            for (i, screen) in NSScreen.screens.enumerated() {
-                log("  screen[\(i)]: frame=\(screen.frame) visibleFrame=\(screen.visibleFrame)")
-            }
-
-            // CG coordinates: top-left origin, Y increases downward
-            // NS coordinates: bottom-left origin, Y increases upward
-            // Primary screen (screens[0]) origin is top-left = NS bottom-left
             let primaryHeight = NSScreen.screens[0].frame.height
-
-            // Terminal top-right in CG: (cgX + cgW, cgY)
-            // Convert to NS: y_ns = primaryHeight - y_cg
             let termRightNS = cgX + cgW
             let termTopNS = primaryHeight - cgY
 
-            // Panel goes at top-right of terminal, inset 16px
             var panelX = termRightNS - panelWidth - 16
             var panelY = termTopNS - panelHeight - 16
 
-            log("findTerminalTopRight: initial NS origin x=\(panelX) y=\(panelY)")
-
-            // Find the screen this terminal is on and clamp
             let termCenterCG = CGPoint(x: cgX + cgW / 2, y: cgY + cgH / 2)
             for screen in NSScreen.screens {
                 let screenCGY = primaryHeight - screen.frame.maxY
@@ -155,15 +262,12 @@ class TOCWindowController {
                     let vf = screen.visibleFrame
                     panelX = min(max(panelX, vf.minX + 8), vf.maxX - panelWidth - 8)
                     panelY = min(max(panelY, vf.minY + 8), vf.maxY - panelHeight - 8)
-                    log("findTerminalTopRight: clamped to screen visibleFrame=\(vf), final x=\(panelX) y=\(panelY)")
                     break
                 }
             }
-
             return NSPoint(x: panelX, y: panelY)
         }
 
-        log("findTerminalTopRight: no terminal window found, using fallback")
         return fallbackPosition(panelWidth: panelWidth, panelHeight: panelHeight)
     }
 
@@ -173,12 +277,41 @@ class TOCWindowController {
         return NSPoint(x: vf.maxX - panelWidth - 20, y: vf.maxY - panelHeight - 20)
     }
 
-    private func sendNotification(title: String, body: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", """
-            display notification "\(body)" with title "\(title)"
-        """]
-        try? process.run()
+    // MARK: - Helpers
+
+    static func extractProjectName(from path: String) -> String? {
+        let url = URL(fileURLWithPath: path)
+        let dir = url.deletingLastPathComponent().lastPathComponent
+        guard dir.hasPrefix("-") || dir.contains("-") else { return nil }
+        let segments = dir.split(separator: "-").map(String.init)
+        guard let last = segments.last, !last.isEmpty else { return nil }
+        return last
     }
 }
+
+/// Handles notification click → activate the correct terminal window
+class NotificationClickHandler: NSObject, UNUserNotificationCenterDelegate, @unchecked Sendable {
+    static let shared = NotificationClickHandler()
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let userInfo = response.notification.request.content.userInfo
+        if let bundleID = userInfo["terminalBundleID"] as? String,
+           let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            NSWorkspace.shared.openApplication(at: appURL, configuration: .init())
+        }
+        completionHandler()
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+}
+

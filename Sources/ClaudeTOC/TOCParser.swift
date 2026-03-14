@@ -12,6 +12,8 @@ struct TOCResult: Sendable {
     let totalLines: Int               // markdown lines
     let estimatedTerminalLines: Int   // estimated rendered terminal lines
     let rawText: String
+    let lastUserQuery: String?        // the user message that triggered this response
+    let responsePreview: String?      // first ~60 chars of assistant response
 }
 
 enum TOCParser {
@@ -23,33 +25,77 @@ enum TOCParser {
 
         let lines = content.components(separatedBy: "\n").filter { !$0.isEmpty }
 
-        // Find the most recent assistant message that has markdown headings
-        let headingCheck = try! NSRegularExpression(pattern: #"^#{1,3}\s+.+"#, options: .anchorsMatchLines)
-        var lastAssistantText = ""
-        for line in lines.reversed() {
+        // Parse all entries to find user query + assistant response
+        struct Entry {
+            let type: String
+            let text: String
+        }
+        var entries: [Entry] = []
+        for line in lines {
             guard let jsonData = line.data(using: .utf8),
                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
                   let type = json["type"] as? String,
-                  type == "assistant",
-                  let message = json["message"] as? [String: Any],
-                  let contentArray = message["content"] as? [[String: Any]] else {
+                  (type == "user" || type == "assistant"),
+                  let message = json["message"] as? [String: Any] else {
                 continue
             }
 
             var textParts: [String] = []
-            for block in contentArray {
-                if let blockType = block["type"] as? String,
-                   blockType == "text",
-                   let text = block["text"] as? String {
-                    textParts.append(text)
+            if let contentArray = message["content"] as? [[String: Any]] {
+                // Array format: [{"type": "text", "text": "..."}]
+                for block in contentArray {
+                    if let blockType = block["type"] as? String,
+                       blockType == "text",
+                       let text = block["text"] as? String {
+                        textParts.append(text)
+                    }
                 }
+            } else if let contentStr = message["content"] as? String, !contentStr.isEmpty {
+                // String format (common for user messages)
+                textParts.append(contentStr)
             }
 
             if !textParts.isEmpty {
-                let joined = textParts.joined(separator: "\n")
-                let range = NSRange(joined.startIndex..<joined.endIndex, in: joined)
-                if headingCheck.firstMatch(in: joined, range: range) != nil {
-                    lastAssistantText = joined
+                entries.append(Entry(type: type, text: textParts.joined(separator: "\n")))
+            }
+        }
+
+        // Find the last user query and last assistant message
+        var lastUserQuery: String?
+        var lastAssistantText = ""
+
+        // Find the most recent assistant message (prefer one with headings)
+        let headingCheck = try! NSRegularExpression(pattern: #"^#{1,3}\s+.+"#, options: .anchorsMatchLines)
+        var lastAssistantIndex: Int?
+
+        // First try: find assistant with headings
+        for i in stride(from: entries.count - 1, through: 0, by: -1) {
+            let entry = entries[i]
+            guard entry.type == "assistant" else { continue }
+            let range = NSRange(entry.text.startIndex..<entry.text.endIndex, in: entry.text)
+            if headingCheck.firstMatch(in: entry.text, range: range) != nil {
+                lastAssistantText = entry.text
+                lastAssistantIndex = i
+                break
+            }
+        }
+
+        // Fallback: use last assistant message even without headings
+        if lastAssistantText.isEmpty {
+            for i in stride(from: entries.count - 1, through: 0, by: -1) {
+                if entries[i].type == "assistant" {
+                    lastAssistantText = entries[i].text
+                    lastAssistantIndex = i
+                    break
+                }
+            }
+        }
+
+        // Find the user message before this assistant response
+        if let ai = lastAssistantIndex {
+            for i in stride(from: ai - 1, through: 0, by: -1) {
+                if entries[i].type == "user" {
+                    lastUserQuery = entries[i].text
                     break
                 }
             }
@@ -96,11 +142,23 @@ enum TOCParser {
             }
         }
 
+        // Build response preview: first non-heading, non-empty line, truncated
+        let previewLine = textLines.first { line in
+            !line.isEmpty && !line.hasPrefix("#") && !line.hasPrefix("```")
+        }
+        let responsePreview: String? = previewLine.map { line in
+            let maxLen = 60
+            if line.count <= maxLen { return line }
+            return String(line.prefix(maxLen)) + "…"
+        }
+
         return TOCResult(
             headings: headings,
             totalLines: textLines.count,
             estimatedTerminalLines: currentTerminalLine,
-            rawText: lastAssistantText
+            rawText: lastAssistantText,
+            lastUserQuery: lastUserQuery,
+            responsePreview: responsePreview
         )
     }
 

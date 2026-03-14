@@ -9,7 +9,7 @@ let package = Package(
         .executableTarget(
             name: "ClaudeTOC",
             linkerSettings: [
-                .unsafeFlags(["-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__info_plist", "-Xlinker", "/dev/null"], .when(platforms: [.macOS]))
+                .unsafeFlags(["-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__info_plist", "-Xlinker", "Info.plist"], .when(platforms: [.macOS]))
             ]
         ),
     ]
