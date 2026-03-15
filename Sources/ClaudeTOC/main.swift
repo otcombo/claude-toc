@@ -36,10 +36,16 @@ if let path = transcriptPath {
 class AppDelegate: NSObject, NSApplicationDelegate {
     let sessionManager = TOCSessionManager()
     let menuBar = MenuBarController()
+    let windowObserver = WindowObserver()
     var socketServer: SocketServer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("Starting as main instance")
+
+        // Wire up window observer for panel visibility management
+        windowObserver.sessionManager = sessionManager
+        sessionManager.windowObserver = windowObserver
+        windowObserver.start()
 
         sessionManager.onSessionsChanged = { [weak self] in
             self?.menuBar.updateMenu()

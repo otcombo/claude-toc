@@ -60,51 +60,25 @@ enum TOCParser {
             }
         }
 
-        // Find the last user query and last assistant message
+        // 1. Always find the LATEST user query and assistant response (for notification)
         var lastUserQuery: String?
-        var lastAssistantText = ""
-
-        // Find the most recent assistant message (prefer one with headings)
-        let headingCheck = try! NSRegularExpression(pattern: #"^#{1,3}\s+.+"#, options: .anchorsMatchLines)
-        var lastAssistantIndex: Int?
-
-        // First try: find assistant with headings
+        var latestAssistantText: String?
         for i in stride(from: entries.count - 1, through: 0, by: -1) {
-            let entry = entries[i]
-            guard entry.type == "assistant" else { continue }
-            let range = NSRange(entry.text.startIndex..<entry.text.endIndex, in: entry.text)
-            if headingCheck.firstMatch(in: entry.text, range: range) != nil {
-                lastAssistantText = entry.text
-                lastAssistantIndex = i
-                break
+            if entries[i].type == "assistant" && latestAssistantText == nil {
+                latestAssistantText = entries[i].text
             }
+            if entries[i].type == "user" && lastUserQuery == nil {
+                lastUserQuery = entries[i].text
+            }
+            if lastUserQuery != nil && latestAssistantText != nil { break }
         }
 
-        // Fallback: use last assistant message even without headings
-        if lastAssistantText.isEmpty {
-            for i in stride(from: entries.count - 1, through: 0, by: -1) {
-                if entries[i].type == "assistant" {
-                    lastAssistantText = entries[i].text
-                    lastAssistantIndex = i
-                    break
-                }
-            }
-        }
+        // 2. Only use the LATEST assistant message for TOC (never show stale headings)
+        let tocText = latestAssistantText ?? ""
+        guard !tocText.isEmpty else { return nil }
 
-        // Find the user message before this assistant response
-        if let ai = lastAssistantIndex {
-            for i in stride(from: ai - 1, through: 0, by: -1) {
-                if entries[i].type == "user" {
-                    lastUserQuery = entries[i].text
-                    break
-                }
-            }
-        }
-
-        guard !lastAssistantText.isEmpty else { return nil }
-
-        // Extract markdown headings with estimated terminal line positions
-        let textLines = lastAssistantText.components(separatedBy: "\n")
+        // Extract markdown headings from the heading-bearing assistant text
+        let textLines = tocText.components(separatedBy: "\n")
         var headings: [TOCHeading] = []
         var insideCodeBlock = false
         var currentTerminalLine = 0
@@ -142,8 +116,9 @@ enum TOCParser {
             }
         }
 
-        // Build response preview: first non-heading, non-empty line, truncated
-        let previewLine = textLines.first { line in
+        // Build response preview from the LATEST assistant response (not the heading one)
+        let previewLines = (latestAssistantText ?? tocText).components(separatedBy: "\n")
+        let previewLine = previewLines.first { line in
             !line.isEmpty && !line.hasPrefix("#") && !line.hasPrefix("```")
         }
         let responsePreview: String? = previewLine.map { line in
@@ -156,7 +131,7 @@ enum TOCParser {
             headings: headings,
             totalLines: textLines.count,
             estimatedTerminalLines: currentTerminalLine,
-            rawText: lastAssistantText,
+            rawText: tocText,
             lastUserQuery: lastUserQuery,
             responsePreview: responsePreview
         )

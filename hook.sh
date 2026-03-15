@@ -1,11 +1,12 @@
 #!/bin/bash
 # Claude Code Stop hook — launches TOC panel after Claude finishes responding
 
-CLAUDE_TOC_BIN="${HOME}/Applications/ClaudeTOC.app/Contents/MacOS/ClaudeTOC"
+PROJECT_DIR="${HOME}/Documents/Playgrounds/claude-toc"
+CLAUDE_TOC_BIN="${PROJECT_DIR}/build/ClaudeTOC.app/Contents/MacOS/ClaudeTOC"
 
 # Fallback to debug build if .app not found
 if [ ! -f "$CLAUDE_TOC_BIN" ]; then
-    CLAUDE_TOC_BIN="${HOME}/Documents/Playgrounds/claude-toc/.build/arm64-apple-macosx/debug/ClaudeTOC"
+    CLAUDE_TOC_BIN="${PROJECT_DIR}/.build/arm64-apple-macosx/debug/ClaudeTOC"
 fi
 
 # Read stdin to a temp file
