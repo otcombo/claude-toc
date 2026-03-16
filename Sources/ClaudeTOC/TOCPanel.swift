@@ -3,6 +3,44 @@ import SwiftUI
 @preconcurrency import UserNotifications
 
 /// A floating panel that doesn't steal focus from the terminal
+class TOCHostingView<Content: View>: NSHostingView<Content> {
+    private var cursorTrackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = cursorTrackingArea {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .mouseMoved, .cursorUpdate, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        cursorTrackingArea = area
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        NSCursor.pointingHand.set()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        NSCursor.pointingHand.push()
+        super.mouseEntered(with: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        NSCursor.pointingHand.set()
+        super.mouseMoved(with: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        NSCursor.pop()
+        super.mouseExited(with: event)
+    }
+}
+
 class TOCPanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
@@ -24,6 +62,7 @@ class TOCPanel: NSPanel {
         self.isMovableByWindowBackground = false
         self.animationBehavior = .utilityWindow
         self.hidesOnDeactivate = false
+        self.acceptsMouseMovedEvents = true
     }
 }
 
@@ -315,11 +354,12 @@ class TOCSessionManager {
 
     private func panelOriginFromWindowFrame(_ windowFrame: CGRect, panelWidth: CGFloat, panelHeight: CGFloat) -> NSPoint {
         let primaryHeight = NSScreen.screens[0].frame.height
+        let titleBarHeight: CGFloat = 28
         let termRightNS = windowFrame.maxX
         let termTopNS = primaryHeight - windowFrame.minY
 
         var panelX = termRightNS - panelWidth - 16
-        var panelY = termTopNS - panelHeight - 16
+        var panelY = termTopNS - panelHeight - titleBarHeight - 16
 
         let termCenterCG = CGPoint(x: windowFrame.midX, y: windowFrame.midY)
         for screen in NSScreen.screens {
@@ -339,19 +379,9 @@ class TOCSessionManager {
 
     private func showPanel(for session: TOCSession) {
         guard let tocResult = session.tocResult else { return }
-        let rowHeight: CGFloat = 28
-        let headerHeight: CGFloat = 40
-        let contentHeight = min(CGFloat(tocResult.headings.count) * rowHeight + headerHeight, 400)
-        let panelWidth: CGFloat = 260
-
-        let panelOrigin = findTerminalTopRight(
-            terminalApp: session.terminalApp, panelWidth: panelWidth, panelHeight: contentHeight)
-        let panelRect = NSRect(x: panelOrigin.x, y: panelOrigin.y, width: panelWidth, height: contentHeight)
-
-        let newPanel = TOCPanel(contentRect: panelRect)
         let sessionId = session.id
 
-        let hostingView = NSHostingView(rootView: TOCView(
+        let hostingView = TOCHostingView(rootView: TOCView(
             headings: tocResult.headings,
             totalLines: tocResult.totalLines,
             onHeadingClick: { [weak self] heading in
@@ -362,6 +392,16 @@ class TOCSessionManager {
             }
         ))
 
+        // Let SwiftUI determine the intrinsic size
+        let fittingSize = hostingView.fittingSize
+        let panelWidth = fittingSize.width
+        let panelHeight = fittingSize.height
+
+        let panelOrigin = findTerminalTopRight(
+            terminalApp: session.terminalApp, panelWidth: panelWidth, panelHeight: panelHeight)
+        let panelRect = NSRect(x: panelOrigin.x, y: panelOrigin.y, width: panelWidth, height: panelHeight)
+
+        let newPanel = TOCPanel(contentRect: panelRect)
         newPanel.contentView = hostingView
         newPanel.orderFrontRegardless()
         session.panel = newPanel
@@ -457,11 +497,12 @@ class TOCSessionManager {
             }
 
             let primaryHeight = NSScreen.screens[0].frame.height
+            let titleBarHeight: CGFloat = 28
             let termRightNS = cgX + cgW
             let termTopNS = primaryHeight - cgY
 
             var panelX = termRightNS - panelWidth - 16
-            var panelY = termTopNS - panelHeight - 16
+            var panelY = termTopNS - panelHeight - titleBarHeight - 16
 
             let termCenterCG = CGPoint(x: cgX + cgW / 2, y: cgY + cgH / 2)
             for screen in NSScreen.screens {

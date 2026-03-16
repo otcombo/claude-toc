@@ -4,7 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "ClaudeTOC",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v26)],
     targets: [
         .executableTarget(
             name: "ClaudeTOC",
