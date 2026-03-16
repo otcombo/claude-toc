@@ -4,6 +4,8 @@ import Foundation
 // Parse args before NSApplication starts
 var transcriptPath: String?
 var hookPid: Int32?
+var terminalBundleId: String?
+var terminalColumns: Int?
 
 let cliArgs = Array(CommandLine.arguments.dropFirst())
 var positional: [String] = []
@@ -11,6 +13,12 @@ var argIdx = 0
 while argIdx < cliArgs.count {
     if cliArgs[argIdx] == "--hook-pid", argIdx + 1 < cliArgs.count {
         hookPid = Int32(cliArgs[argIdx + 1])
+        argIdx += 2
+    } else if cliArgs[argIdx] == "--terminal-bundle-id", argIdx + 1 < cliArgs.count {
+        terminalBundleId = cliArgs[argIdx + 1]
+        argIdx += 2
+    } else if cliArgs[argIdx] == "--terminal-columns", argIdx + 1 < cliArgs.count {
+        terminalColumns = Int(cliArgs[argIdx + 1])
         argIdx += 2
     } else {
         positional.append(cliArgs[argIdx])
@@ -24,7 +32,7 @@ if let first = positional.first {
 
 // Try sending to a running instance BEFORE starting NSApplication
 if let path = transcriptPath {
-    let msg = IPCMessage(transcriptPath: path, hookPid: hookPid)
+    let msg = IPCMessage(transcriptPath: path, hookPid: hookPid, terminalBundleId: terminalBundleId, terminalColumns: terminalColumns)
     if SocketClient.send(message: msg) {
         // Successfully sent to running instance — just exit
         exit(0)
@@ -54,14 +62,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         socketServer = SocketServer { [weak self] msg in
             DispatchQueue.main.async {
-                self?.sessionManager.addSession(transcriptPath: msg.transcriptPath, hookPid: msg.hookPid)
+                self?.sessionManager.addSession(transcriptPath: msg.transcriptPath, hookPid: msg.hookPid, terminalBundleId: msg.terminalBundleId, terminalColumns: msg.terminalColumns)
             }
         }
         socketServer?.start()
 
         // Handle the initial transcript that started us
         if let path = transcriptPath {
-            sessionManager.addSession(transcriptPath: path, hookPid: hookPid)
+            sessionManager.addSession(transcriptPath: path, hookPid: hookPid, terminalBundleId: terminalBundleId, terminalColumns: terminalColumns)
         }
     }
 }

@@ -31,7 +31,7 @@ enum TerminalType: String, Sendable {
 @MainActor
 enum TerminalAdapter {
 
-    static func detectTerminal(hookPid: Int32? = nil) -> (TerminalType, NSRunningApplication?) {
+    static func detectTerminal(hookPid: Int32? = nil, bundleId providedBundleId: String? = nil) -> (TerminalType, NSRunningApplication?) {
         let knownBundleIds: [String: TerminalType] = [
             "net.kovidgoyal.kitty": .kitty,
             "com.googlecode.iterm2": .iterm2,
@@ -42,6 +42,18 @@ enum TerminalAdapter {
         ]
 
         let runningApps = NSWorkspace.shared.runningApplications
+
+        // Prefer terminal bundle ID passed from hook (via $TERM_PROGRAM etc.)
+        if let bid = providedBundleId {
+            let termType = knownBundleIds[bid] ?? .unknown
+            if let app = runningApps.first(where: { $0.bundleIdentifier == bid }) {
+                log("detectTerminal: using provided bundleId \(bid)")
+                return (termType, app)
+            }
+            log("detectTerminal: provided bundleId \(bid) not found in running apps")
+        }
+
+        // Fallback: walk process tree from hook PID
         var pidToApp: [Int32: NSRunningApplication] = [:]
         for app in runningApps {
             pidToApp[app.processIdentifier] = app

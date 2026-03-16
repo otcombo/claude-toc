@@ -4,6 +4,8 @@ import Foundation
 struct IPCMessage: Codable, Sendable {
     let transcriptPath: String
     let hookPid: Int32?
+    let terminalBundleId: String?
+    let terminalColumns: Int?
 }
 
 /// User-isolated socket path (macOS $TMPDIR includes per-user directory)

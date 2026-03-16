@@ -10,7 +10,7 @@ class TOCPanel: NSPanel {
     init(contentRect: NSRect) {
         super.init(
             contentRect: contentRect,
-            styleMask: [.nonactivatingPanel, .titled, .fullSizeContentView, .closable],
+            styleMask: [.nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -21,9 +21,7 @@ class TOCPanel: NSPanel {
 
         self.isOpaque = false
         self.backgroundColor = .clear
-        self.titleVisibility = .hidden
-        self.titlebarAppearsTransparent = true
-        self.isMovableByWindowBackground = true
+        self.isMovableByWindowBackground = false
         self.animationBehavior = .utilityWindow
         self.hidesOnDeactivate = false
     }
@@ -79,15 +77,15 @@ class TOCSessionManager {
         Array(sessions.values).sorted { $0.id < $1.id }
     }
 
-    func addSession(transcriptPath: String, hookPid: Int32?) {
+    func addSession(transcriptPath: String, hookPid: Int32?, terminalBundleId: String? = nil, terminalColumns: Int? = nil) {
         let sessionId = URL(fileURLWithPath: transcriptPath).deletingPathExtension().lastPathComponent
         let projectName = Self.extractProjectName(from: transcriptPath)
 
         log("SessionManager: adding session \(sessionId), project: \(projectName ?? "unknown")")
 
-        // Detect terminal
-        let (terminalType, terminalApp) = TerminalAdapter.detectTerminal(hookPid: hookPid)
-        let termColumns = TerminalAdapter.estimateColumns(app: terminalApp)
+        // Detect terminal — prefer bundle ID from hook if available
+        let (terminalType, terminalApp) = TerminalAdapter.detectTerminal(hookPid: hookPid, bundleId: terminalBundleId)
+        let termColumns = terminalColumns ?? TerminalAdapter.estimateColumns(app: terminalApp)
 
         let tocResult = TOCParser.parse(transcriptPath: transcriptPath, terminalColumns: termColumns)
 
