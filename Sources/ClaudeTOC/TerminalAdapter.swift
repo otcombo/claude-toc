@@ -196,15 +196,11 @@ enum TerminalAdapter {
             }
         }
 
-        // Calculate target absolute line
-        // After Claude responds, the terminal shows:
-        //   [response content]     ← responseTerminalLines lines
-        //   ─────────────────      ← separator
-        //   › [cursor]             ← prompt (AXInsertionPointLineNumber points here)
-        //   ─────────────────      ← separator
-        //   ? for shortcuts        ← help hint
-        // So cursor is ~4 lines below the response end
-        let claudeUIChrome = 4
+        // Calculate target absolute line by detecting Claude UI chrome dynamically.
+        // After Claude responds, the terminal shows separator lines (─────) below the
+        // response. We search backwards from the cursor to find the first separator,
+        // which marks the boundary between response content and Claude's prompt UI.
+        let claudeUIChrome = detectChromeLines(textArea: textArea, cursorLine: cursorLine)
         let responseEndLine = cursorLine - claudeUIChrome
         let headingAbsLine = responseEndLine - responseTerminalLines + heading.estimatedTerminalLine
         log("jumpToHeading: responseEndLine=\(responseEndLine) headingAbsLine=\(headingAbsLine)")
@@ -233,6 +229,55 @@ enum TerminalAdapter {
         // Set the scroll position
         let result = AXUIElementSetAttributeValue(scrollBar, kAXValueAttribute as CFString, NSNumber(value: clampedValue) as CFTypeRef)
         log("jumpToHeading: set scroll bar to \(clampedValue), result = \(result == .success ? "success" : "failed (\(result.rawValue))")")
+    }
+
+    // MARK: - Chrome detection
+
+    /// Detect the number of UI chrome lines between the response end and cursor
+    /// by scanning backwards from the cursor looking for the separator (─) pattern.
+    /// Falls back to 4 if detection fails.
+    private static func detectChromeLines(textArea: AXUIElement, cursorLine: Int) -> Int {
+        let fallback = 4
+        // Scan the last ~10 lines before cursor looking for separator characters
+        let scanStart = max(0, cursorLine - 10)
+        for lineNum in stride(from: cursorLine, through: scanStart, by: -1) {
+            // Get the character range for this line
+            var rangeRef: CFTypeRef?
+            guard AXUIElementCopyParameterizedAttributeValue(
+                textArea,
+                kAXRangeForLineParameterizedAttribute as CFString,
+                NSNumber(value: lineNum) as CFTypeRef,
+                &rangeRef
+            ) == .success else { continue }
+
+            let axRange = rangeRef as! AXValue
+            var cfRange = CFRange(location: 0, length: 0)
+            AXValueGetValue(axRange, .cfRange, &cfRange)
+
+            guard cfRange.length > 0 else { continue }
+
+            // Get the text content of this line
+            let rangeValue = AXValueCreate(.cfRange, &cfRange)!
+            var textRef: CFTypeRef?
+            guard AXUIElementCopyParameterizedAttributeValue(
+                textArea,
+                kAXStringForRangeParameterizedAttribute as CFString,
+                rangeValue as CFTypeRef,
+                &textRef
+            ) == .success,
+                  let lineText = textRef as? String else { continue }
+
+            // Claude's separator is a line of box-drawing characters (─ U+2500)
+            let trimmed = lineText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.count >= 3 && trimmed.allSatisfy({ $0 == "─" || $0 == "━" || $0 == "—" || $0 == "-" }) {
+                let chrome = cursorLine - lineNum
+                log("detectChromeLines: found separator at line \(lineNum), chrome=\(chrome)")
+                return chrome
+            }
+        }
+
+        log("detectChromeLines: no separator found, using fallback=\(fallback)")
+        return fallback
     }
 
     // MARK: - AX helpers
