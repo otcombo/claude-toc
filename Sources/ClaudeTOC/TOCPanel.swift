@@ -72,6 +72,21 @@ class TOCSessionManager {
     private var sessions: [String: TOCSession] = [:]
     var onSessionsChanged: (() -> Void)?
     var windowObserver: WindowObserver?
+    private var notificationAuthorized = false
+
+    /// Request notification authorization once at startup
+    func requestNotificationAuthorization() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = NotificationClickHandler.shared
+        center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, error in
+            log("Notification authorization: granted=\(granted), error=\(error?.localizedDescription ?? "nil")")
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self?.notificationAuthorized = granted
+                }
+            }
+        }
+    }
 
     var activeSessions: [TOCSession] {
         Array(sessions.values).sorted { $0.id < $1.id }
@@ -117,8 +132,13 @@ class TOCSessionManager {
         sessions[sessionId] = session
         log("SessionManager: session \(sessionId) active, total sessions: \(sessions.count)")
 
-        // Always send notification
-        sendNotification(for: session)
+        // Only send notification if the terminal is not in the foreground
+        let terminalIsActive = session.terminalApp?.isActive == true
+        if !terminalIsActive {
+            sendNotification(for: session)
+        } else {
+            log("SessionManager: skipping notification — terminal is active")
+        }
 
         onSessionsChanged?()
     }
@@ -340,9 +360,6 @@ class TOCSessionManager {
     // MARK: - Notification
 
     private func sendNotification(for session: TOCSession) {
-        let center = UNUserNotificationCenter.current()
-        center.delegate = NotificationClickHandler.shared
-
         // Title: Responded "user query"
         let notifTitle: String
         if let q = session.tocResult?.lastUserQuery {
@@ -359,30 +376,27 @@ class TOCSessionManager {
         // Body: first line of the latest response
         let notifBody = session.tocResult?.responsePreview ?? "New response"
 
-        log("sendNotification: requesting authorization...")
-        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
-            log("sendNotification: authorization granted=\(granted), error=\(error?.localizedDescription ?? "nil")")
-            if granted {
-                let content = UNMutableNotificationContent()
-                content.title = notifTitle
-                content.body = notifBody
-                if let bundleID = session.terminalApp?.bundleIdentifier {
-                    content.userInfo = ["terminalBundleID": bundleID]
-                }
-                let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-                center.add(request) { addError in
-                    log("sendNotification: add result error=\(addError?.localizedDescription ?? "nil")")
-                }
-            } else {
-                // Fallback to osascript when UNUserNotification is not authorized
-                let escapedTitle = notifTitle.replacingOccurrences(of: "\"", with: "\\\"")
-                let escapedBody = notifBody.replacingOccurrences(of: "\"", with: "\\\"")
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                process.arguments = ["-e", "display notification \"\(escapedBody)\" with title \"\(escapedTitle)\""]
-                try? process.run()
-                log("sendNotification: used osascript fallback")
+        if notificationAuthorized {
+            let content = UNMutableNotificationContent()
+            content.title = notifTitle
+            content.body = notifBody
+            if let bundleID = session.terminalApp?.bundleIdentifier {
+                content.userInfo = ["terminalBundleID": bundleID]
             }
+            let center = UNUserNotificationCenter.current()
+            let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+            center.add(request) { addError in
+                log("sendNotification: add result error=\(addError?.localizedDescription ?? "nil")")
+            }
+        } else {
+            // Fallback to osascript when UNUserNotification is not authorized
+            let escapedTitle = notifTitle.replacingOccurrences(of: "\"", with: "\\\"")
+            let escapedBody = notifBody.replacingOccurrences(of: "\"", with: "\\\"")
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = ["-e", "display notification \"\(escapedBody)\" with title \"\(escapedTitle)\""]
+            try? process.run()
+            log("sendNotification: used osascript fallback")
         }
     }
 

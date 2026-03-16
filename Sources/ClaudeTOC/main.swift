@@ -50,6 +50,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("Starting as main instance")
 
+        // Request notification authorization once at startup
+        sessionManager.requestNotificationAuthorization()
+
         // Wire up window observer for panel visibility management
         windowObserver.sessionManager = sessionManager
         sessionManager.windowObserver = windowObserver
