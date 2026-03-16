@@ -6,7 +6,41 @@ struct IPCMessage: Codable, Sendable {
     let hookPid: Int32?
 }
 
-private let socketPath = "/tmp/claude-toc.sock"
+/// User-isolated socket path (macOS $TMPDIR includes per-user directory)
+private let socketPath: String = {
+    let tmpDir = NSTemporaryDirectory()
+    return (tmpDir as NSString).appendingPathComponent("claude-toc.sock")
+}()
+
+/// Maximum bytes the server will read from a single client connection (64 KB)
+private let maxReadBytes = 65_536
+
+/// Read/write timeout for socket operations (seconds)
+private let socketTimeout: Int = 5
+
+/// Set SO_RCVTIMEO on a file descriptor
+private func setReceiveTimeout(fd: Int32, seconds: Int) {
+    var tv = timeval(tv_sec: seconds, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+}
+
+/// Set SO_SNDTIMEO on a file descriptor
+private func setSendTimeout(fd: Int32, seconds: Int) {
+    var tv = timeval(tv_sec: seconds, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+}
+
+/// Bind a sockaddr_un to the given path
+private func makeUnixAddress() -> sockaddr_un {
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+        socketPath.withCString { cstr in
+            _ = strcpy(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: CChar.self), cstr)
+        }
+    }
+    return addr
+}
 
 /// Listens on a Unix domain socket for incoming IPCMessages
 class SocketServer {
@@ -27,14 +61,7 @@ class SocketServer {
             return
         }
 
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-            socketPath.withCString { cstr in
-                _ = strcpy(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: CChar.self), cstr)
-            }
-        }
-
+        var addr = makeUnixAddress()
         let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
         let bindResult = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -67,22 +94,27 @@ class SocketServer {
         let clientFD = accept(fileDescriptor, nil, nil)
         guard clientFD >= 0 else { return }
 
-        // Read all data then close
+        // Set timeouts to prevent hanging on misbehaving clients
+        setReceiveTimeout(fd: clientFD, seconds: socketTimeout)
+        setSendTimeout(fd: clientFD, seconds: socketTimeout)
+
+        // Read data with size limit
         var data = Data()
         var buf = [UInt8](repeating: 0, count: 4096)
-        while true {
+        while data.count < maxReadBytes {
             let n = read(clientFD, &buf, buf.count)
             if n <= 0 { break }
             data.append(contentsOf: buf[..<n])
         }
 
+        // Send OK first, then process — avoids client blocking on read while we decode
+        _ = "OK".withCString { write(clientFD, $0, 2) }
+        close(clientFD)
+
         if let msg = try? JSONDecoder().decode(IPCMessage.self, from: data) {
             log("SocketServer: received session for \(msg.transcriptPath)")
             handler(msg)
         }
-        // Send OK
-        _ = "OK".withCString { write(clientFD, $0, 2) }
-        close(clientFD)
     }
 
     func stop() {
@@ -101,14 +133,11 @@ enum SocketClient {
         guard fd >= 0 else { return false }
         defer { close(fd) }
 
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-            socketPath.withCString { cstr in
-                _ = strcpy(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: CChar.self), cstr)
-            }
-        }
+        // Set timeouts so we don't hang forever
+        setReceiveTimeout(fd: fd, seconds: socketTimeout)
+        setSendTimeout(fd: fd, seconds: socketTimeout)
 
+        var addr = makeUnixAddress()
         let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
         let connectResult = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
