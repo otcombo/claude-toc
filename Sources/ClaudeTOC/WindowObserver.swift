@@ -12,6 +12,9 @@ class WindowObserver {
     private var pollTimer: Timer?
     private var lastKnownWindowFrames: [pid_t: CGRect] = [:]
     private var axTrusted = false
+    /// Prevent premature deallocation while AXObserver callbacks hold a raw pointer to self.
+    /// Incremented on first registerAXObserver, decremented when all observers are removed.
+    private var retainedSelf: Unmanaged<WindowObserver>?
 
     func start() {
         axTrusted = AXIsProcessTrusted()
@@ -70,6 +73,12 @@ class WindowObserver {
         }
         axObservers.removeAll()
         trackedWindows.removeAll()
+
+        // Release the safety retain now that all callbacks are removed
+        if let retained = retainedSelf {
+            retained.release()
+            retainedSelf = nil
+        }
     }
 
     // MARK: - AXObserver per terminal app
@@ -95,6 +104,11 @@ class WindowObserver {
         }
 
         let axApp = AXUIElementCreateApplication(pid)
+
+        // Retain self while any AXObserver holds a raw pointer to us
+        if retainedSelf == nil {
+            retainedSelf = Unmanaged.passRetained(self)
+        }
         let refcon = Unmanaged.passUnretained(self).toOpaque()
 
         AXObserverAddNotification(observer, axApp, kAXFocusedWindowChangedNotification as CFString, refcon)
@@ -112,6 +126,12 @@ class WindowObserver {
         untrackWindow(for: pid, observer: observer)
         lastKnownWindowFrames.removeValue(forKey: pid)
         log("WindowObserver: unregistered AXObserver for pid \(pid)")
+
+        // Release the safety retain when no more AXObservers hold our pointer
+        if axObservers.isEmpty, let retained = retainedSelf {
+            retained.release()
+            retainedSelf = nil
+        }
     }
 
     // MARK: - Window-level move/resize tracking (AX)
