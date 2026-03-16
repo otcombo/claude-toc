@@ -77,6 +77,7 @@ class TOCSessionManager {
     /// Request notification authorization once at startup
     func requestNotificationAuthorization() {
         let center = UNUserNotificationCenter.current()
+        NotificationClickHandler.shared.sessionManager = self
         center.delegate = NotificationClickHandler.shared
         center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, error in
             log("Notification authorization: granted=\(granted), error=\(error?.localizedDescription ?? "nil")")
@@ -377,6 +378,20 @@ class TOCSessionManager {
         )
     }
 
+    /// Activate the terminal and scroll to the first line of the response
+    func scrollToResponseStart(sessionId: String) {
+        guard let session = sessions[sessionId],
+              let tocResult = session.tocResult,
+              let termApp = session.terminalApp else { return }
+        // Create a synthetic heading at line 0 (start of response)
+        let startHeading = TOCHeading(level: 1, title: "", lineInResponse: 0, estimatedTerminalLine: 0)
+        TerminalAdapter.jumpToHeading(
+            heading: startHeading,
+            responseTerminalLines: tocResult.estimatedTerminalLines,
+            app: termApp
+        )
+    }
+
     // MARK: - Notification
 
     private func sendNotification(for session: TOCSession) {
@@ -400,9 +415,10 @@ class TOCSessionManager {
             let content = UNMutableNotificationContent()
             content.title = notifTitle
             content.body = notifBody
-            if let bundleID = session.terminalApp?.bundleIdentifier {
-                content.userInfo = ["terminalBundleID": bundleID]
-            }
+            content.userInfo = [
+                "sessionId": session.id,
+                "terminalBundleID": session.terminalApp?.bundleIdentifier ?? "",
+            ]
             let center = UNUserNotificationCenter.current()
             let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
             center.add(request) { addError in
@@ -482,9 +498,13 @@ class TOCSessionManager {
     }
 }
 
-/// Handles notification click → activate the correct terminal window
+/// Handles notification click → activate the correct terminal window and scroll to response
 class NotificationClickHandler: NSObject, UNUserNotificationCenterDelegate, @unchecked Sendable {
     static let shared = NotificationClickHandler()
+    weak var sessionManager: TOCSessionManager?
+
+    private var pendingScrollSessionId: String?
+    private var activationObserver: NSObjectProtocol?
 
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
@@ -492,10 +512,47 @@ class NotificationClickHandler: NSObject, UNUserNotificationCenterDelegate, @unc
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let userInfo = response.notification.request.content.userInfo
-        if let bundleID = userInfo["terminalBundleID"] as? String,
+        let sessionId = userInfo["sessionId"] as? String
+
+        // Activate terminal window
+        if let bundleID = userInfo["terminalBundleID"] as? String, !bundleID.isEmpty,
            let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            // Wait for the terminal to actually become frontmost before scrolling
+            if let sid = sessionId {
+                pendingScrollSessionId = sid
+                // Remove any previous observer
+                if let obs = activationObserver {
+                    NSWorkspace.shared.notificationCenter.removeObserver(obs)
+                }
+                activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                    forName: NSWorkspace.didActivateApplicationNotification,
+                    object: nil, queue: .main
+                ) { [weak self] notification in
+                    guard let self = self,
+                          let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                          app.bundleIdentifier == bundleID,
+                          let sid = self.pendingScrollSessionId else { return }
+                    // Terminal is now active — scroll
+                    MainActor.assumeIsolated {
+                        self.sessionManager?.scrollToResponseStart(sessionId: sid)
+                    }
+                    self.pendingScrollSessionId = nil
+                    if let obs = self.activationObserver {
+                        NSWorkspace.shared.notificationCenter.removeObserver(obs)
+                        self.activationObserver = nil
+                    }
+                }
+            }
             NSWorkspace.shared.openApplication(at: appURL, configuration: .init())
+        } else if let sid = sessionId {
+            // Terminal already active or unknown — scroll directly
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self.sessionManager?.scrollToResponseStart(sessionId: sid)
+                }
+            }
         }
+
         completionHandler()
     }
 
