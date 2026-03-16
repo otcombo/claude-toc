@@ -5,9 +5,9 @@
     <key>CFBundleIdentifier</key>
     <string>com.otcombo.claude-toc</string>
     <key>CFBundleName</key>
-    <string>ClaudeTOC</string>
+    <string>TOC for Claude Code</string>
     <key>CFBundleDisplayName</key>
-    <string>Claude TOC</string>
+    <string>TOC for Claude Code</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
@@ -16,6 +16,8 @@
     <string>1.0</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
+    <key>CFBundleIconName</key>
+    <string>appicon</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>LSUIElement</key>

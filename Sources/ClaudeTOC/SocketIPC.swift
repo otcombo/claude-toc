@@ -6,6 +6,8 @@ struct IPCMessage: Codable, Sendable {
     let hookPid: Int32?
     let terminalBundleId: String?
     let terminalColumns: Int?
+    let tty: String?
+    let windowId: UInt32?
 }
 
 /// User-isolated socket path (macOS $TMPDIR includes per-user directory)

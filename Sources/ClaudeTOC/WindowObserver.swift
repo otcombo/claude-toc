@@ -19,11 +19,6 @@ class WindowObserver {
     func start() {
         axTrusted = AXIsProcessTrusted()
         log("WindowObserver: AXIsProcessTrusted=\(axTrusted)")
-        if !axTrusted {
-            let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
-            AXIsProcessTrustedWithOptions(options)
-            log("WindowObserver: prompted for accessibility permission")
-        }
 
         let nc = NSWorkspace.shared.notificationCenter
 

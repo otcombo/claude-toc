@@ -6,6 +6,7 @@ struct TOCView: View {
     let onHeadingClick: (TOCHeading) -> Void
     let onDismiss: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
     @State private var hoveredIndex: Int? = nil
     @State private var dismissHovered = false
 
@@ -14,8 +15,10 @@ struct TOCView: View {
             // Title bar
             HStack {
                 Image(systemName: "list.dash")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 13, weight: .semibold))
+                    .frame(width: 20, height: 20)
+                    .foregroundStyle(Color.primary.opacity(0.8))
+                    
                 Spacer()
                 Button(action: onDismiss) {
                     Image(systemName: "xmark")
@@ -30,7 +33,8 @@ struct TOCView: View {
                     dismissHovered = inside
                 }
             }
-            .padding(.horizontal, 14)
+            .padding(.leading, 14)
+            .padding(.trailing, 12)
             .padding(.top, 12)
             
 
@@ -50,8 +54,9 @@ struct TOCView: View {
                         headingRow(heading, index: index)
                     }
                 }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 6)
+                .padding(.leading, 14)
+                .padding(.trailing, 4)
+                .padding(.vertical, 8)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(HorizontalBounceFixer())
             }
@@ -61,9 +66,10 @@ struct TOCView: View {
         .frame(width: 180)
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxHeight: 300)
-        .padding(.bottom, 6)
+        .padding(.bottom, 12)
+        .background(colorScheme == .light ? Color.white.opacity(0.25) : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 24))
-        .glassEffect(.regular, in: .rect(cornerRadius: 24))
+        .glassEffect(.clear, in: .rect(cornerRadius: 24))
     }
 
     private var minLevel: Int {
@@ -72,14 +78,14 @@ struct TOCView: View {
 
     @ViewBuilder
     private func headingRow(_ heading: TOCHeading, index: Int) -> some View {
-        let indent: CGFloat = CGFloat((heading.level - minLevel) * 6)
+        let indent: CGFloat = CGFloat((heading.level - minLevel) * 8)
         let isHovered = hoveredIndex == index
 
         Button(action: { onHeadingClick(heading) }) {
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Circle()
                     .fill(Color.primary.opacity(isHovered ? 1.0 : 0.3))
-                    .frame(width: 5, height: 5)
+                    .frame(width: 4, height: 4)
 
                 Text(heading.title)
                     .font(.system(size: fontSize(for: heading.level), weight: weight(for: heading.level)))
@@ -89,8 +95,7 @@ struct TOCView: View {
 
                 Spacer()
             }
-            .padding(.leading, 10 + indent)
-            .padding(.trailing, 10)
+            .padding(.leading,2 + indent)
             .frame(height: 20)
             .contentShape(Rectangle())
         }
@@ -105,8 +110,8 @@ struct TOCView: View {
     private func fontSize(for level: Int) -> CGFloat {
         switch level {
         case 1: return 13
-        case 2: return 12
-        default: return 11
+        case 2: return 13
+        default: return 13
         }
     }
 

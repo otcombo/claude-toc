@@ -10,7 +10,8 @@ class MenuBarController: NSObject {
         self.sessionManager = sessionManager
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "list.bullet.rectangle", accessibilityDescription: "Claude TOC")
+            let config = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
+            button.image = NSImage(systemSymbolName: "list.dash", accessibilityDescription: "TOC for Claude Code")?.withSymbolConfiguration(config)
             button.image?.isTemplate = true
         }
         updateMenu()

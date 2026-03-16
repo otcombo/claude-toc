@@ -66,6 +66,16 @@ class TOCPanel: NSPanel {
     }
 }
 
+/// Get CGWindowID from an AXUIElement (private but stable API)
+@_silgen_name("_AXUIElementGetWindow")
+func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+func windowIDFromAXElement(_ element: AXUIElement) -> CGWindowID? {
+    var wid: CGWindowID = 0
+    guard _AXUIElementGetWindow(element, &wid) == .success, wid != 0 else { return nil }
+    return wid
+}
+
 /// Represents one Claude Code session with its TOC panel
 @MainActor
 class TOCSession {
@@ -76,11 +86,12 @@ class TOCSession {
     let terminalType: TerminalType
     let terminalApp: NSRunningApplication?
     var axWindow: AXUIElement?       // the specific terminal window at hook time
+    var windowID: CGWindowID?        // stable window identifier for matching
     var panel: TOCPanel?
 
     init(id: String, transcriptPath: String, projectName: String?, tocResult: TOCResult?,
          terminalType: TerminalType, terminalApp: NSRunningApplication?,
-         axWindow: AXUIElement? = nil) {
+         axWindow: AXUIElement? = nil, windowID: CGWindowID? = nil) {
         self.id = id
         self.transcriptPath = transcriptPath
         self.projectName = projectName
@@ -88,6 +99,7 @@ class TOCSession {
         self.terminalType = terminalType
         self.terminalApp = terminalApp
         self.axWindow = axWindow
+        self.windowID = windowID
     }
 
     var menuTitle: String {
@@ -132,25 +144,40 @@ class TOCSessionManager {
         Array(sessions.values).sorted { $0.id < $1.id }
     }
 
-    func addSession(transcriptPath: String, hookPid: Int32?, terminalBundleId: String? = nil, terminalColumns: Int? = nil) {
+    func addSession(transcriptPath: String, hookPid: Int32?, terminalBundleId: String? = nil, terminalColumns: Int? = nil, tty: String? = nil, windowId: UInt32? = nil) {
         let sessionId = URL(fileURLWithPath: transcriptPath).deletingPathExtension().lastPathComponent
         let projectName = Self.extractProjectName(from: transcriptPath)
 
-        log("SessionManager: adding session \(sessionId), project: \(projectName ?? "unknown")")
+        log("SessionManager: adding session \(sessionId), project: \(projectName ?? "unknown"), tty: \(tty ?? "nil"), windowId: \(windowId.map(String.init) ?? "nil")")
 
         // Detect terminal — prefer bundle ID from hook if available
         let (terminalType, terminalApp) = TerminalAdapter.detectTerminal(hookPid: hookPid, bundleId: terminalBundleId)
         let termColumns = terminalColumns ?? TerminalAdapter.estimateColumns(app: terminalApp)
 
-        let tocResult = TOCParser.parse(transcriptPath: transcriptPath, terminalColumns: termColumns)
-
-        log("SessionManager: headings=\(tocResult?.headings.count ?? 0), query: \(tocResult?.lastUserQuery?.prefix(40) ?? "nil")")
-
-        // Capture the focused window of this terminal (hook fires when terminal is active)
+        // Match window: prefer hook-provided windowId, fall back to focused window
         var axWindow: AXUIElement?
+        var windowID: CGWindowID?
         if let termApp = terminalApp {
-            axWindow = WindowObserver.getFocusedWindow(of: termApp)
-            log("SessionManager: captured axWindow=\(axWindow != nil ? "yes" : "no")")
+            // Use window ID passed from hook (resolved via osascript in Terminal's context)
+            if let wid = windowId {
+                windowID = CGWindowID(wid)
+                axWindow = findAXWindowByID(CGWindowID(wid), app: termApp)
+                if axWindow != nil {
+                    log("SessionManager: hook windowId=\(wid) matched AX window")
+                } else {
+                    log("SessionManager: hook windowId=\(wid) — no AX match, will use ID only")
+                }
+            }
+
+            // Fallback: use focused window
+            if windowID == nil {
+                axWindow = WindowObserver.getFocusedWindow(of: termApp)
+                if let ax = axWindow {
+                    windowID = windowIDFromAXElement(ax)
+                }
+                log("SessionManager: fallback focused windowID=\(windowID.map(String.init) ?? "nil")")
+            }
+
             // Register AXObserver for this terminal app (idempotent)
             windowObserver?.registerAXObserver(for: termApp)
         }
@@ -158,10 +185,67 @@ class TOCSessionManager {
         // Close existing panel for this session
         sessions[sessionId]?.panel?.close()
 
+        // Parse transcript — retry briefly if the latest entry isn't an assistant message yet
+        // (the Stop hook can fire before the transcript file is fully flushed)
+        let tocResult = TOCParser.parse(transcriptPath: transcriptPath, terminalColumns: termColumns)
+        if tocResult == nil || !Self.transcriptEndsWithAssistant(path: transcriptPath) {
+            log("SessionManager: transcript not ready, scheduling retry")
+            let capturedTerminalApp = terminalApp
+            let capturedTerminalType = terminalType
+            let capturedAxWindow = axWindow
+            let capturedWindowID = windowID
+            // Retry after a short delay
+            Task { @MainActor in
+                for attempt in 1...5 {
+                    try? await Task.sleep(for: .milliseconds(500))
+                    let retryResult = TOCParser.parse(transcriptPath: transcriptPath, terminalColumns: termColumns)
+                    let ready = Self.transcriptEndsWithAssistant(path: transcriptPath)
+                    log("SessionManager: retry \(attempt), headings=\(retryResult?.headings.count ?? 0), ready=\(ready)")
+                    if ready, let result = retryResult {
+                        self.finalizeSession(
+                            sessionId: sessionId, transcriptPath: transcriptPath,
+                            projectName: projectName, tocResult: result,
+                            terminalType: capturedTerminalType, terminalApp: capturedTerminalApp,
+                            axWindow: capturedAxWindow, windowID: capturedWindowID
+                        )
+                        return
+                    }
+                }
+                // Timeout — use whatever we have
+                log("SessionManager: retry timeout, using available data")
+                let finalResult = TOCParser.parse(transcriptPath: transcriptPath, terminalColumns: termColumns)
+                self.finalizeSession(
+                    sessionId: sessionId, transcriptPath: transcriptPath,
+                    projectName: projectName, tocResult: finalResult,
+                    terminalType: capturedTerminalType, terminalApp: capturedTerminalApp,
+                    axWindow: capturedAxWindow, windowID: capturedWindowID
+                )
+            }
+            return
+        }
+
+        log("SessionManager: headings=\(tocResult?.headings.count ?? 0), query: \(tocResult?.lastUserQuery?.prefix(40) ?? "nil")")
+
+        finalizeSession(
+            sessionId: sessionId, transcriptPath: transcriptPath,
+            projectName: projectName, tocResult: tocResult,
+            terminalType: terminalType, terminalApp: terminalApp,
+            axWindow: axWindow, windowID: windowID
+        )
+    }
+
+    private func finalizeSession(
+        sessionId: String, transcriptPath: String, projectName: String?,
+        tocResult: TOCResult?, terminalType: TerminalType,
+        terminalApp: NSRunningApplication?, axWindow: AXUIElement?, windowID: CGWindowID?
+    ) {
+        // Close existing panel for this session
+        sessions[sessionId]?.panel?.close()
+
         let session = TOCSession(
             id: sessionId, transcriptPath: transcriptPath, projectName: projectName,
             tocResult: tocResult, terminalType: terminalType, terminalApp: terminalApp,
-            axWindow: axWindow
+            axWindow: axWindow, windowID: windowID
         )
 
         // Show TOC panel only if there are headings
@@ -170,7 +254,7 @@ class TOCSessionManager {
         }
 
         sessions[sessionId] = session
-        log("SessionManager: session \(sessionId) active, total sessions: \(sessions.count)")
+        log("SessionManager: session \(sessionId) finalized, windowID=\(windowID.map(String.init) ?? "nil"), headings=\(tocResult?.headings.count ?? 0), total sessions: \(sessions.count)")
 
         // Only send notification if the terminal is not in the foreground
         let terminalIsActive = session.terminalApp?.isActive == true
@@ -181,6 +265,34 @@ class TOCSessionManager {
         }
 
         onSessionsChanged?()
+    }
+
+    /// Check if the last entry in the transcript JSONL is an assistant message
+    private static func transcriptEndsWithAssistant(path: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: path),
+              let content = String(data: data, encoding: .utf8) else { return false }
+        let lines = content.components(separatedBy: "\n").filter { !$0.isEmpty }
+        guard let lastLine = lines.last,
+              let jsonData = lastLine.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let type = json["type"] as? String else { return false }
+        return type == "assistant"
+    }
+
+    /// Find an AXUIElement window by its CGWindowID
+    private func findAXWindowByID(_ targetWID: CGWindowID, app: NSRunningApplication) -> AXUIElement? {
+        let pid = app.processIdentifier
+        let axApp = AXUIElementCreateApplication(pid)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AXUIElement] else { return nil }
+
+        for window in windows {
+            if let wid = windowIDFromAXElement(window), wid == targetWID {
+                return window
+            }
+        }
+        return nil
     }
 
     func closeAll() {
@@ -258,24 +370,36 @@ class TOCSessionManager {
             return
         }
 
-        // Get the focused window of the active terminal app
-        let focusedWindow = WindowObserver.getFocusedWindow(of: activeApp)
+        // Get the focused window of the active terminal app and its stable ID
+        let focusedAXWindow = WindowObserver.getFocusedWindow(of: activeApp)
+        let focusedWID: CGWindowID? = focusedAXWindow.flatMap { windowIDFromAXElement($0) }
+
+        log("updateVisiblePanels: activeApp=\(activeApp.bundleIdentifier ?? "?") pid=\(activeAppPid), focusedWID=\(focusedWID.map(String.init) ?? "nil"), focusedAX=\(focusedAXWindow != nil)")
 
         for session in sessions.values {
             guard session.panel != nil else { continue }
 
             if session.terminalApp?.processIdentifier == activeAppPid {
-                // This session belongs to the active app
-                if let sessionWindow = session.axWindow, let focusedWin = focusedWindow {
-                    // We can compare windows — show only the matching one
-                    if CFEqual(sessionWindow, focusedWin) {
+                // This session belongs to the active app — match by CGWindowID
+                log("  session \(session.id.prefix(8)): sessionWID=\(session.windowID.map(String.init) ?? "nil"), axWindow=\(session.axWindow != nil)")
+                if let sessionWID = session.windowID, let currentWID = focusedWID {
+                    if sessionWID == currentWID {
+                        log("  → MATCH, showing")
+                        // Update axWindow reference in case it went stale
+                        session.axWindow = focusedAXWindow
                         repositionAndShow(session)
                     } else {
+                        log("  → MISMATCH (\(sessionWID) != \(currentWID)), hiding")
                         session.panel?.orderOut(nil)
                     }
-                } else {
-                    // No axWindow recorded (fallback) — show all sessions for this app
+                } else if focusedWID == nil {
+                    // Can't determine focused window — show all as fallback
+                    log("  → focusedWID nil, fallback show")
                     repositionAndShow(session)
+                } else {
+                    // Session has no windowID but we know the focused window — hide it
+                    log("  → session has no WID, hiding")
+                    session.panel?.orderOut(nil)
                 }
             } else {
                 session.panel?.orderOut(nil)

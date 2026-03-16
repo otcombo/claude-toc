@@ -51,6 +51,7 @@ enum TerminalAdapter {
             "dev.warp.Warp-Stable": .warp,
             "org.alacritty": .alacritty,
             "com.termius-dmg.mac": .termius,
+            "com.todesktop.230313mzl4w4u92": .termius,
         ]
 
         let runningApps = NSWorkspace.shared.runningApplications
