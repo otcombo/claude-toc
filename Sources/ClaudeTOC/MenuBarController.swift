@@ -29,13 +29,43 @@ class MenuBarController: NSObject {
         // Session list
         if let sessions = sessionManager?.activeSessions, !sessions.isEmpty {
             for session in sessions {
-                let item = NSMenuItem(title: session.menuTitle, action: #selector(sessionClicked(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = session.id
-                if session.panel != nil {
-                    item.state = .on
+                let sessionItem = NSMenuItem(title: session.menuTitle, action: nil, keyEquivalent: "")
+                let submenu = NSMenu()
+
+                let hasTOC = session.tocResult.map { !$0.headings.isEmpty } ?? false
+                let panelVisible = session.panel != nil
+
+                if hasTOC {
+                    if panelVisible {
+                        let hide = NSMenuItem(title: "Hide TOC", action: #selector(hideSessionClicked(_:)), keyEquivalent: "")
+                        hide.target = self
+                        hide.representedObject = session.id
+                        submenu.addItem(hide)
+                    } else {
+                        let show = NSMenuItem(title: "Show TOC", action: #selector(showSessionClicked(_:)), keyEquivalent: "")
+                        show.target = self
+                        show.representedObject = session.id
+                        submenu.addItem(show)
+                    }
                 }
-                menu.addItem(item)
+
+                let focus = NSMenuItem(title: "Focus Terminal", action: #selector(sessionClicked(_:)), keyEquivalent: "")
+                focus.target = self
+                focus.representedObject = session.id
+                submenu.addItem(focus)
+
+                submenu.addItem(.separator())
+
+                let remove = NSMenuItem(title: "Remove", action: #selector(removeSessionClicked(_:)), keyEquivalent: "")
+                remove.target = self
+                remove.representedObject = session.id
+                submenu.addItem(remove)
+
+                sessionItem.submenu = submenu
+                if panelVisible {
+                    sessionItem.state = .on
+                }
+                menu.addItem(sessionItem)
             }
         } else {
             let empty = NSMenuItem(title: "No active sessions", action: nil, keyEquivalent: "")
@@ -115,6 +145,22 @@ class MenuBarController: NSObject {
     @objc private func sessionClicked(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         sessionManager?.focusSession(id: id)
+    }
+
+    @objc private func hideSessionClicked(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        sessionManager?.hideSession(id: id)
+    }
+
+    @objc private func showSessionClicked(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        sessionManager?.reshowSession(id: id)
+    }
+
+    @objc private func removeSessionClicked(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        sessionManager?.removeSession(id: id)
+        updateMenu()
     }
 
     @objc private func openAccessibilitySettings() {

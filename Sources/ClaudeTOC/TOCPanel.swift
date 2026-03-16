@@ -152,7 +152,18 @@ class TOCSessionManager {
         onSessionsChanged?()
     }
 
-    func closeSession(id: String) {
+    /// Hide the TOC panel but keep the session alive so it can be re-shown
+    func hideSession(id: String) {
+        guard let session = sessions[id] else { return }
+        session.panel?.orderOut(nil)
+        session.panel?.close()
+        session.panel = nil
+        log("SessionManager: hidden session \(id)")
+        onSessionsChanged?()
+    }
+
+    /// Remove the session entirely (from menu bar "Remove" action)
+    func removeSession(id: String) {
         let removedSession = sessions[id]
         removedSession?.panel?.close()
         sessions.removeValue(forKey: id)
@@ -164,6 +175,15 @@ class TOCSessionManager {
                 windowObserver?.unregisterAXObserver(for: pid)
             }
         }
+        onSessionsChanged?()
+    }
+
+    /// Re-show a hidden session's TOC panel
+    func reshowSession(id: String) {
+        guard let session = sessions[id], session.panel == nil,
+              let tocResult = session.tocResult, !tocResult.headings.isEmpty else { return }
+        showPanel(for: session)
+        log("SessionManager: re-shown session \(id)")
         onSessionsChanged?()
     }
 
@@ -337,7 +357,7 @@ class TOCSessionManager {
                 self?.handleHeadingClick(heading, sessionId: sessionId)
             },
             onDismiss: { [weak self] in
-                self?.closeSession(id: sessionId)
+                self?.hideSession(id: sessionId)
             }
         ))
 

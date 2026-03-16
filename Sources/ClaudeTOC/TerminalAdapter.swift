@@ -1,20 +1,32 @@
 import AppKit
 import Foundation
 
-let logFile = "/tmp/claude-toc.log"
+/// Persistent log file handle — opened once, reused for all writes.
+/// Truncated on launch if over 1 MB (simple log rotation).
+private let logHandle: FileHandle? = {
+    let path = (NSTemporaryDirectory() as NSString).appendingPathComponent("claude-toc.log")
+    let fm = FileManager.default
+
+    // Simple rotation: truncate if over 1 MB
+    if let attrs = try? fm.attributesOfItem(atPath: path),
+       let size = attrs[.size] as? UInt64, size > 1_048_576 {
+        try? fm.removeItem(atPath: path)
+    }
+
+    if !fm.fileExists(atPath: path) {
+        fm.createFile(atPath: path, contents: nil)
+    }
+    guard let handle = FileHandle(forWritingAtPath: path) else { return nil }
+    handle.seekToEndOfFile()
+    return handle
+}()
 
 func log(_ msg: String) {
-    let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(msg)\n"
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(timestamp)] \(msg)\n"
     fputs(line, stderr)
     if let data = line.data(using: .utf8) {
-        if FileManager.default.fileExists(atPath: logFile) {
-            let handle = FileHandle(forWritingAtPath: logFile)!
-            handle.seekToEndOfFile()
-            handle.write(data)
-            handle.closeFile()
-        } else {
-            FileManager.default.createFile(atPath: logFile, contents: data)
-        }
+        logHandle?.write(data)
     }
 }
 
