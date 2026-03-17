@@ -7,5 +7,5 @@ DerivedData/
 .swiftpm/configuration/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
-test_parse.swift
-test_transcript.jsonl
+Test/
+.claude/
