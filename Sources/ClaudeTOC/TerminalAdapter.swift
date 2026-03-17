@@ -200,7 +200,7 @@ enum TerminalAdapter {
         }
     }
 
-    // MARK: - Tier A: AX ScrollBar
+    // MARK: - Tier A: AX Text Search + ScrollBar
 
     private static func jumpViaAXScrollBar(heading: TOCHeading, responseTerminalLines: Int, pid: Int32) {
         let axApp = AXUIElementCreateApplication(pid)
@@ -229,49 +229,61 @@ enum TerminalAdapter {
             return
         }
 
+        // Get full buffer text via AXValue
+        var valueRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(textArea, kAXValueAttribute as CFString, &valueRef) == .success,
+              let fullText = valueRef as? String, !fullText.isEmpty else {
+            log("tierA: failed to get AXValue (full text)")
+            return
+        }
+        log("tierA: fullText length = \(fullText.count) chars")
+
+        // Search for heading in terminal buffer
+        let targetLine = findHeadingLine(heading: heading, fullText: fullText, textArea: textArea)
+        guard let targetLine = targetLine else {
+            log("tierA: heading not found in buffer, aborting")
+            return
+        }
+        log("tierA: targetLine = \(targetLine)")
+
+        // Get total lines (cursor line ≈ last line in buffer)
         var cursorLineRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(textArea, kAXInsertionPointLineNumberAttribute as CFString, &cursorLineRef) == .success,
-              let cursorLine = (cursorLineRef as? NSNumber)?.intValue else {
+              let totalLines = (cursorLineRef as? NSNumber)?.intValue else {
             log("tierA: failed to get AXInsertionPointLineNumber")
             return
         }
-        log("tierA: cursorLine (total lines) = \(cursorLine)")
 
-        var visRangeRef: CFTypeRef?
+        // Get visible rows
         var visibleRows = 40
+        var visRangeRef: CFTypeRef?
         if AXUIElementCopyAttributeValue(textArea, kAXVisibleCharacterRangeAttribute as CFString, &visRangeRef) == .success {
             let visRange = visRangeRef as! AXValue
             var cfRange = CFRange(location: 0, length: 0)
             AXValueGetValue(visRange, .cfRange, &cfRange)
 
-            let startIndex = cfRange.location
-            let endIndex = cfRange.location + cfRange.length - 1
-
             var startLineRef: CFTypeRef?
             var endLineRef: CFTypeRef?
-            if AXUIElementCopyParameterizedAttributeValue(textArea, kAXLineForIndexParameterizedAttribute as CFString, NSNumber(value: startIndex) as CFTypeRef, &startLineRef) == .success,
-               AXUIElementCopyParameterizedAttributeValue(textArea, kAXLineForIndexParameterizedAttribute as CFString, NSNumber(value: max(0, endIndex)) as CFTypeRef, &endLineRef) == .success,
+            let endIndex = max(0, cfRange.location + cfRange.length - 1)
+            if AXUIElementCopyParameterizedAttributeValue(textArea, kAXLineForIndexParameterizedAttribute as CFString, NSNumber(value: cfRange.location) as CFTypeRef, &startLineRef) == .success,
+               AXUIElementCopyParameterizedAttributeValue(textArea, kAXLineForIndexParameterizedAttribute as CFString, NSNumber(value: endIndex) as CFTypeRef, &endLineRef) == .success,
                let startLine = (startLineRef as? NSNumber)?.intValue,
                let endLine = (endLineRef as? NSNumber)?.intValue {
                 visibleRows = max(endLine - startLine, 1)
-                log("tierA: visibleRows = \(visibleRows) (lines \(startLine)...\(endLine))")
+                log("tierA: visibleRows = \(visibleRows)")
             }
         }
 
-        let claudeUIChrome = detectChromeLines(textArea: textArea, cursorLine: cursorLine)
-        let responseEndLine = cursorLine - claudeUIChrome
-        let headingAbsLine = responseEndLine - responseTerminalLines + heading.estimatedTerminalLine
-        log("tierA: responseEndLine=\(responseEndLine) headingAbsLine=\(headingAbsLine)")
-
-        let maxScrollLine = cursorLine - visibleRows
+        let maxScrollLine = totalLines - visibleRows
         guard maxScrollLine > 0 else {
             log("tierA: content fits in viewport, no scroll needed")
             return
         }
 
-        let scrollValue = Float(max(0, headingAbsLine)) / Float(maxScrollLine)
+        // Offset by 2 lines so the heading is visible below the top edge
+        let scrollValue = Float(max(0, targetLine - 2)) / Float(maxScrollLine)
         let clampedValue = min(max(scrollValue, 0.0), 1.0)
-        log("tierA: scrollValue = \(headingAbsLine) / \(maxScrollLine) = \(scrollValue) → clamped \(clampedValue)")
+        log("tierA: scrollValue = \(targetLine) / \(maxScrollLine) = \(clampedValue)")
 
         var scrollBarRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(scrollArea, kAXVerticalScrollBarAttribute as CFString, &scrollBarRef) == .success else {
@@ -284,26 +296,182 @@ enum TerminalAdapter {
         log("tierA: set scroll bar to \(clampedValue), result = \(result == .success ? "success" : "failed (\(result.rawValue))")")
     }
 
-    // MARK: - Tier B: CLI/IPC
+    /// Search for a heading in the AX text buffer and return its exact line number.
+    /// Strategy: search for "\n## Title\n" pattern (with markdown prefix) backwards from end.
+    /// Falls back to plain title search if markdown pattern not found.
+    private static func findHeadingLine(heading: TOCHeading, fullText: String, textArea: AXUIElement) -> Int? {
+        // Special case: empty title means "scroll to response start"
+        // Find the last separator line (───) which marks the boundary before the response
+        if heading.title.isEmpty {
+            return findResponseStart(fullText: fullText, textArea: textArea)
+        }
+
+        let hashPrefix = String(repeating: "#", count: heading.level)
+
+        // Strategy 1: Search for markdown heading pattern "\n## Title\n"
+        let mdPattern = "\n\(hashPrefix) \(heading.title)\n"
+        if let range = fullText.range(of: mdPattern, options: .backwards) {
+            // +1 to skip the leading \n, point to the # character
+            let charOffset = fullText.distance(from: fullText.startIndex, to: range.lowerBound) + 1
+            return axLineForCharIndex(charOffset, textArea: textArea)
+        }
+
+        // Strategy 2: Try without trailing newline (heading at very end)
+        let mdPatternNoTrail = "\n\(hashPrefix) \(heading.title)"
+        if let range = fullText.range(of: mdPatternNoTrail, options: .backwards) {
+            let charOffset = fullText.distance(from: fullText.startIndex, to: range.lowerBound) + 1
+            return axLineForCharIndex(charOffset, textArea: textArea)
+        }
+
+        // Strategy 3: Plain title search (last resort, less precise)
+        // Only use if title is distinctive enough (>= 6 chars)
+        if heading.title.count >= 6 {
+            if let range = fullText.range(of: heading.title, options: .backwards) {
+                let charOffset = fullText.distance(from: fullText.startIndex, to: range.lowerBound)
+                log("tierA/findHeading: fell back to plain text search for '\(heading.title)'")
+                return axLineForCharIndex(charOffset, textArea: textArea)
+            }
+        }
+
+        log("tierA/findHeading: '\(heading.title)' not found in buffer")
+        return nil
+    }
+
+    /// Find the start of the current response by locating the last separator (───) before the response.
+    /// Returns the line number just after the separator block.
+    private static func findResponseStart(fullText: String, textArea: AXUIElement) -> Int? {
+        // Search backwards for a line of separator characters (─)
+        // The separator appears as a line of ─ characters between messages
+        // We want the second-to-last separator (the one before the current response)
+        // since the last separator is after the response
+        var searchEnd = fullText.endIndex
+        var separatorCount = 0
+
+        while searchEnd > fullText.startIndex {
+            let searchRange = fullText.startIndex..<searchEnd
+            // Look for a run of ─ characters (at least 10)
+            guard let range = fullText.range(of: "──────────", options: .backwards, range: searchRange) else {
+                break
+            }
+
+            separatorCount += 1
+            if separatorCount == 2 {
+                // Found the separator before the current response
+                // Skip past the separator line to the response content
+                // Find the next newline after the separator
+                let afterSep = range.upperBound
+                if let nlRange = fullText.range(of: "\n", range: afterSep..<fullText.endIndex) {
+                    let charOffset = fullText.distance(from: fullText.startIndex, to: nlRange.upperBound)
+                    log("tierA/findResponseStart: found separator, response starts at char \(charOffset)")
+                    return axLineForCharIndex(charOffset, textArea: textArea)
+                }
+            }
+            searchEnd = range.lowerBound
+        }
+
+        // If only one separator found (first message), use it
+        if separatorCount == 1 {
+            // Re-search for the first (only) separator
+            if let range = fullText.range(of: "──────────", options: .backwards) {
+                let afterSep = range.upperBound
+                if let nlRange = fullText.range(of: "\n", range: afterSep..<fullText.endIndex) {
+                    let charOffset = fullText.distance(from: fullText.startIndex, to: nlRange.upperBound)
+                    return axLineForCharIndex(charOffset, textArea: textArea)
+                }
+            }
+        }
+
+        log("tierA/findResponseStart: no separator found")
+        return nil
+    }
+
+    /// Convert a character index to an AX line number
+    private static func axLineForCharIndex(_ charIndex: Int, textArea: AXUIElement) -> Int? {
+        var lineRef: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            textArea,
+            kAXLineForIndexParameterizedAttribute as CFString,
+            NSNumber(value: charIndex) as CFTypeRef,
+            &lineRef
+        ) == .success,
+              let line = (lineRef as? NSNumber)?.intValue else {
+            return nil
+        }
+        return line
+    }
+
+    // MARK: - Tier B: CLI/IPC (Text Search)
 
     private static func jumpViaCLI(heading: TOCHeading, responseTerminalLines: Int, terminalType: TerminalType) {
-        // Lines from the bottom of the response to the heading
-        let linesFromBottom = responseTerminalLines - heading.estimatedTerminalLine
-        // Add chrome lines (separator + prompt ≈ 4 lines)
-        let scrollUpLines = linesFromBottom + 4
-
         switch terminalType {
         case .kitty:
-            jumpViaKitty(scrollUpLines: scrollUpLines)
+            jumpViaKitty(heading: heading, responseTerminalLines: responseTerminalLines)
         case .wezterm:
-            jumpViaWezTerm(scrollUpLines: scrollUpLines)
+            jumpViaWezTerm(heading: heading, responseTerminalLines: responseTerminalLines)
         default:
             log("tierB: unsupported terminal \(terminalType.rawValue)")
         }
     }
 
-    private static func jumpViaKitty(scrollUpLines: Int) {
-        // First scroll to bottom, then scroll up the exact number of lines
+    /// Get full terminal text via CLI, search for heading, return lines-from-bottom.
+    /// Falls back to estimation if text retrieval or search fails.
+    private static func cliTextSearchLinesFromBottom(heading: TOCHeading, responseTerminalLines: Int, getText: () -> String?) -> Int {
+        if let fullText = getText(), !fullText.isEmpty {
+            let searchPattern: String
+            if heading.title.isEmpty {
+                // "scroll to response start" — find the second-to-last separator
+                searchPattern = "──────────"
+            } else {
+                let hashPrefix = String(repeating: "#", count: heading.level)
+                searchPattern = "\n\(hashPrefix) \(heading.title)\n"
+            }
+
+            if let range = fullText.range(of: searchPattern, options: .backwards) {
+                let textAfterMatch = fullText[range.lowerBound...]
+                let linesFromBottom = textAfterMatch.components(separatedBy: "\n").count - 1
+                // +2 offset so heading appears below the top edge of viewport
+                let adjusted = max(0, linesFromBottom + 2)
+                log("tierB/textSearch: found '\(heading.title)' at \(linesFromBottom) lines from bottom → \(adjusted)")
+                return adjusted
+            }
+            log("tierB/textSearch: pattern not found, falling back to estimation")
+        } else {
+            log("tierB/textSearch: failed to get text, falling back to estimation")
+        }
+
+        // Fallback: old estimation method
+        let linesFromBottom = responseTerminalLines - heading.estimatedTerminalLine + 4
+        log("tierB/textSearch: fallback linesFromBottom=\(linesFromBottom)")
+        return linesFromBottom
+    }
+
+    /// Run a CLI command and capture stdout
+    private static func runCLI(_ arguments: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            return String(data: data, encoding: .utf8)
+        } catch {
+            return nil
+        }
+    }
+
+    private static func jumpViaKitty(heading: TOCHeading, responseTerminalLines: Int) {
+        let scrollUpLines = cliTextSearchLinesFromBottom(
+            heading: heading,
+            responseTerminalLines: responseTerminalLines,
+            getText: { runCLI(["kitten", "@", "get-text", "--extent", "all"]) }
+        )
+
+        // Scroll to bottom, then scroll up exact lines
         let scrollToEnd = Process()
         scrollToEnd.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         scrollToEnd.arguments = ["kitten", "@", "scroll-window", "end"]
@@ -318,22 +486,27 @@ enum TerminalAdapter {
         log("tierB/kitty: scrolled to end then up \(scrollUpLines) lines, exit=\(scrollUp.terminationStatus)")
     }
 
-    private static func jumpViaWezTerm(scrollUpLines: Int) {
-        // WezTerm: scroll to bottom first via Cmd+End key sequence, then send PageUp escape sequences
-        // Use wezterm cli to send escape sequences
+    private static func jumpViaWezTerm(heading: TOCHeading, responseTerminalLines: Int) {
+        let scrollUpLines = cliTextSearchLinesFromBottom(
+            heading: heading,
+            responseTerminalLines: responseTerminalLines,
+            getText: { runCLI(["wezterm", "cli", "get-text", "--start-line", "-9999", "--end-line", "9999"]) }
+        )
+
+        // Scroll to bottom first
         let scrollToEnd = Process()
         scrollToEnd.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        scrollToEnd.arguments = ["wezterm", "cli", "send-text", "--no-paste", "\u{1b}[F"] // End key
+        scrollToEnd.arguments = ["wezterm", "cli", "send-text", "--no-paste", "\u{1b}[F"]
         try? scrollToEnd.run()
         scrollToEnd.waitUntilExit()
 
-        // Send PageUp sequences — each PageUp scrolls ~viewport lines, estimate viewport as 40
+        // PageUp to approximate position
         let viewportRows = 40
         let pageUps = max(1, (scrollUpLines + viewportRows / 2) / viewportRows)
         for i in 0..<pageUps {
             let pageUp = Process()
             pageUp.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            pageUp.arguments = ["wezterm", "cli", "send-text", "--no-paste", "\u{1b}[5~"] // PageUp
+            pageUp.arguments = ["wezterm", "cli", "send-text", "--no-paste", "\u{1b}[5~"]
             try? pageUp.run()
             pageUp.waitUntilExit()
             if i < pageUps - 1 {
@@ -398,54 +571,7 @@ enum TerminalAdapter {
         return 40
     }
 
-    // MARK: - Chrome detection
 
-    /// Detect the number of UI chrome lines between the response end and cursor
-    /// by scanning backwards from the cursor looking for the separator (─) pattern.
-    /// Falls back to 4 if detection fails.
-    private static func detectChromeLines(textArea: AXUIElement, cursorLine: Int) -> Int {
-        let fallback = 4
-        // Scan the last ~10 lines before cursor looking for separator characters
-        let scanStart = max(0, cursorLine - 10)
-        for lineNum in stride(from: cursorLine, through: scanStart, by: -1) {
-            // Get the character range for this line
-            var rangeRef: CFTypeRef?
-            guard AXUIElementCopyParameterizedAttributeValue(
-                textArea,
-                kAXRangeForLineParameterizedAttribute as CFString,
-                NSNumber(value: lineNum) as CFTypeRef,
-                &rangeRef
-            ) == .success else { continue }
-
-            let axRange = rangeRef as! AXValue
-            var cfRange = CFRange(location: 0, length: 0)
-            AXValueGetValue(axRange, .cfRange, &cfRange)
-
-            guard cfRange.length > 0 else { continue }
-
-            // Get the text content of this line
-            let rangeValue = AXValueCreate(.cfRange, &cfRange)!
-            var textRef: CFTypeRef?
-            guard AXUIElementCopyParameterizedAttributeValue(
-                textArea,
-                kAXStringForRangeParameterizedAttribute as CFString,
-                rangeValue as CFTypeRef,
-                &textRef
-            ) == .success,
-                  let lineText = textRef as? String else { continue }
-
-            // Claude's separator is a line of box-drawing characters (─ U+2500)
-            let trimmed = lineText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.count >= 3 && trimmed.allSatisfy({ $0 == "─" || $0 == "━" || $0 == "—" || $0 == "-" }) {
-                let chrome = cursorLine - lineNum
-                log("detectChromeLines: found separator at line \(lineNum), chrome=\(chrome)")
-                return chrome
-            }
-        }
-
-        log("detectChromeLines: no separator found, using fallback=\(fallback)")
-        return fallback
-    }
 
     // MARK: - AX helpers
 
