@@ -59,7 +59,7 @@ hook.sh (Stop hook)
 3. Gets TTY, terminal columns, window ID
 4. Invokes ClaudeTOC binary which sends IPC to running instance
 
-Supported terminals: Terminal.app, iTerm2, Kitty, Warp, Alacritty, Termius.
+Supported terminals: Terminal.app, iTerm2, Kitty, Warp, Alacritty, Termius, Ghostty, WezTerm, Wave Terminal, Rio, Tabby, Cursor, Hyper.
 
 ## Conventions
 

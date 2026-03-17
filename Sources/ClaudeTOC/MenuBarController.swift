@@ -128,6 +128,13 @@ class MenuBarController: NSObject {
 
         menu.addItem(.separator())
 
+        // Check for Updates (opens window)
+        let checkUpdate = NSMenuItem(title: "Check for Updates…", action: #selector(showUpdateWindow), keyEquivalent: "")
+        checkUpdate.target = self
+        menu.addItem(checkUpdate)
+
+        menu.addItem(.separator())
+
         // Quit
         let quit = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
@@ -162,6 +169,10 @@ class MenuBarController: NSObject {
         guard let id = sender.representedObject as? String else { return }
         sessionManager?.removeSession(id: id)
         updateMenu()
+    }
+
+    @objc private func showUpdateWindow() {
+        Updater.shared.showUpdateWindow()
     }
 
     @objc private func openAccessibilitySettings() {

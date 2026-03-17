@@ -84,6 +84,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("Starting as main instance")
 
+        // Register with Launch Services so the system indexes our app icon
+        // (fixes notification icon for LSUIElement apps running outside /Applications)
+        LSRegisterURL(Bundle.main.bundleURL as CFURL, true)
+
+        // Explicitly load app icon from bundle
+        if let iconURL = Bundle.main.url(forResource: "appicon", withExtension: "icns"),
+           let icon = NSImage(contentsOf: iconURL) {
+            NSApp.applicationIconImage = icon
+        }
+
         // Show onboarding if accessibility not granted
         if !AXIsProcessTrusted() {
             showOnboarding()
@@ -134,6 +144,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.menuBar.updateMenu()
         }
         menuBar.setup(sessionManager: sessionManager)
+
+        // Start auto-updater (daily check + menu refresh on status change)
+        Updater.shared.onStatusChanged = { [weak self] in
+            self?.menuBar.updateMenu()
+        }
+        Updater.shared.startPeriodicCheck()
 
         socketServer = SocketServer { [weak self] msg in
             DispatchQueue.main.async {

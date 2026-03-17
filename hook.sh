@@ -27,6 +27,10 @@ case "${TERM_PROGRAM:-}" in
     iTerm.app)    TERMINAL_BUNDLE_ID="com.googlecode.iterm2" ;;
     Apple_Terminal) TERMINAL_BUNDLE_ID="com.apple.Terminal" ;;
     WarpTerminal) TERMINAL_BUNDLE_ID="dev.warp.Warp-Stable" ;;
+    ghostty)      TERMINAL_BUNDLE_ID="com.mitchellh.ghostty" ;;
+    WezTerm)      TERMINAL_BUNDLE_ID="com.github.wez.wezterm" ;;
+    rio)          TERMINAL_BUNDLE_ID="com.raphaelamorim.rio" ;;
+    Hyper)        TERMINAL_BUNDLE_ID="co.zeit.hyper" ;;
     tmux)
         # Inside tmux, check the outer terminal
         if [ -n "${ITERM_SESSION_ID:-}" ]; then
@@ -42,15 +46,30 @@ fi
 if [ "${TERM:-}" = "alacritty" ]; then
     TERMINAL_BUNDLE_ID="org.alacritty"
 fi
-# Termius detection — walk up process tree looking for Termius or todesktop
+# Walk up process tree for terminals without TERM_PROGRAM (Termius, Cursor, Tabby, Wave)
 if [ -z "$TERMINAL_BUNDLE_ID" ]; then
     _PID=$CALLER_PID
     for _ in 1 2 3 4 5 6; do
         _PID=$(ps -o ppid= -p $_PID 2>/dev/null | tr -d ' ')
         [ -z "$_PID" ] || [ "$_PID" = "1" ] || [ "$_PID" = "0" ] && break
         _CMD=$(ps -o command= -p $_PID 2>/dev/null)
-        if echo "$_CMD" | grep -q "Termius"; then
-            TERMINAL_BUNDLE_ID="com.termius-dmg.mac"
+        case "$_CMD" in
+            *Termius*)  TERMINAL_BUNDLE_ID="com.termius-dmg.mac"; break ;;
+            *Cursor*)   TERMINAL_BUNDLE_ID="com.todesktop.230313mzl4w4u92"; break ;;
+            *Tabby*)    TERMINAL_BUNDLE_ID="org.tabby"; break ;;
+            *Wave*)     TERMINAL_BUNDLE_ID="dev.commandline.waveterm"; break ;;
+        esac
+    done
+fi
+# Cursor sets TERM_PROGRAM=vscode — disambiguate by checking process tree
+if [ "${TERM_PROGRAM:-}" = "vscode" ] && [ -z "$TERMINAL_BUNDLE_ID" ]; then
+    _PID=$CALLER_PID
+    for _ in 1 2 3 4 5 6; do
+        _PID=$(ps -o ppid= -p $_PID 2>/dev/null | tr -d ' ')
+        [ -z "$_PID" ] || [ "$_PID" = "1" ] || [ "$_PID" = "0" ] && break
+        _CMD=$(ps -o command= -p $_PID 2>/dev/null)
+        if echo "$_CMD" | grep -q "Cursor"; then
+            TERMINAL_BUNDLE_ID="com.todesktop.230313mzl4w4u92"
             break
         fi
     done

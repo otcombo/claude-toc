@@ -59,6 +59,13 @@ mkdir -p "$(dirname "$APP_DIR")"
 mv "$STAGE_APP" "$APP_DIR"
 rm -rf "$STAGING"
 
+# Force Launch Services to re-index the app icon (fixes notification icon for LSUIElement apps)
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
+if [ -x "$LSREGISTER" ]; then
+    "$LSREGISTER" -f "$APP_DIR"
+    echo "Registered with Launch Services"
+fi
+
 echo "Done: ${APP_DIR}"
 
 # Create DMG

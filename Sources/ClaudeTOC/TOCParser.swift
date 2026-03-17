@@ -23,57 +23,32 @@ enum TOCParser {
             return nil
         }
 
-        let lines = content.components(separatedBy: "\n").filter { !$0.isEmpty }
+        // Read from tail: only parse the last few JSONL entries to find
+        // the latest user query + assistant response (avoids scanning the entire file)
+        let lines = content.components(separatedBy: "\n")
 
-        // Parse all entries to find user query + assistant response
-        struct Entry {
-            let type: String
-            let text: String
-        }
-        var entries: [Entry] = []
-        for line in lines {
-            guard let jsonData = line.data(using: .utf8),
+        var lastUserQuery: String?
+        var latestAssistantText: String?
+
+        for i in stride(from: lines.count - 1, through: 0, by: -1) {
+            let line = lines[i]
+            guard !line.isEmpty,
+                  let jsonData = line.data(using: .utf8),
                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
                   let type = json["type"] as? String,
-                  (type == "user" || type == "assistant"),
                   let message = json["message"] as? [String: Any] else {
                 continue
             }
 
-            var textParts: [String] = []
-            if let contentArray = message["content"] as? [[String: Any]] {
-                // Array format: [{"type": "text", "text": "..."}]
-                for block in contentArray {
-                    if let blockType = block["type"] as? String,
-                       blockType == "text",
-                       let text = block["text"] as? String {
-                        textParts.append(text)
-                    }
-                }
-            } else if let contentStr = message["content"] as? String, !contentStr.isEmpty {
-                // String format (common for user messages)
-                textParts.append(contentStr)
+            if type == "assistant" && latestAssistantText == nil {
+                latestAssistantText = Self.extractText(from: message)
+            } else if type == "user" && lastUserQuery == nil {
+                lastUserQuery = Self.extractText(from: message)
             }
 
-            if !textParts.isEmpty {
-                entries.append(Entry(type: type, text: textParts.joined(separator: "\n")))
-            }
-        }
-
-        // 1. Always find the LATEST user query and assistant response (for notification)
-        var lastUserQuery: String?
-        var latestAssistantText: String?
-        for i in stride(from: entries.count - 1, through: 0, by: -1) {
-            if entries[i].type == "assistant" && latestAssistantText == nil {
-                latestAssistantText = entries[i].text
-            }
-            if entries[i].type == "user" && lastUserQuery == nil {
-                lastUserQuery = entries[i].text
-            }
             if lastUserQuery != nil && latestAssistantText != nil { break }
         }
 
-        // 2. Only use the LATEST assistant message for TOC (never show stale headings)
         let tocText = latestAssistantText ?? ""
         guard !tocText.isEmpty else { return nil }
 
@@ -116,16 +91,21 @@ enum TOCParser {
             }
         }
 
-        // Build response preview from the LATEST assistant response (not the heading one)
-        let previewLines = (latestAssistantText ?? tocText).components(separatedBy: "\n")
-        let previewLine = previewLines.first { line in
-            !line.isEmpty && !line.hasPrefix("#") && !line.hasPrefix("```")
+        // Build response preview: up to 2 meaningful lines, each capped at 40 chars
+        let allPreviewLines = tocText.components(separatedBy: "\n")
+        var previewCollected: [String] = []
+        for pLine in allPreviewLines {
+            guard previewCollected.count < 2 else { break }
+            let trimmed = pLine.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") || trimmed.hasPrefix("```") { continue }
+            let maxLen = 40
+            if trimmed.count <= maxLen {
+                previewCollected.append(trimmed)
+            } else {
+                previewCollected.append(String(trimmed.prefix(maxLen)) + "…")
+            }
         }
-        let responsePreview: String? = previewLine.map { line in
-            let maxLen = 60
-            if line.count <= maxLen { return line }
-            return String(line.prefix(maxLen)) + "…"
-        }
+        let responsePreview: String? = previewCollected.isEmpty ? nil : previewCollected.joined(separator: "\n")
 
         return TOCResult(
             headings: headings,
@@ -135,6 +115,23 @@ enum TOCParser {
             lastUserQuery: lastUserQuery,
             responsePreview: responsePreview
         )
+    }
+
+    /// Extract text content from a transcript message object
+    private static func extractText(from message: [String: Any]) -> String? {
+        var textParts: [String] = []
+        if let contentArray = message["content"] as? [[String: Any]] {
+            for block in contentArray {
+                if let blockType = block["type"] as? String,
+                   blockType == "text",
+                   let text = block["text"] as? String {
+                    textParts.append(text)
+                }
+            }
+        } else if let contentStr = message["content"] as? String, !contentStr.isEmpty {
+            textParts.append(contentStr)
+        }
+        return textParts.isEmpty ? nil : textParts.joined(separator: "\n")
     }
 
     /// Strip markdown inline formatting characters that terminals render without

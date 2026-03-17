@@ -37,6 +37,13 @@ enum TerminalType: String, Sendable {
     case warp = "dev.warp.Warp-Stable"
     case alacritty = "org.alacritty"
     case termius = "com.termius-dmg.mac"
+    case ghostty = "com.mitchellh.ghostty"
+    case wezterm = "com.github.wez.wezterm"
+    case wave = "dev.commandline.waveterm"
+    case rio = "com.raphaelamorim.rio"
+    case tabby = "org.tabby"
+    case cursor = "com.todesktop.230313mzl4w4u92"
+    case hyper = "co.zeit.hyper"
     case unknown = "unknown"
 }
 
@@ -51,7 +58,13 @@ enum TerminalAdapter {
             "dev.warp.Warp-Stable": .warp,
             "org.alacritty": .alacritty,
             "com.termius-dmg.mac": .termius,
-            "com.todesktop.230313mzl4w4u92": .termius,
+            "com.mitchellh.ghostty": .ghostty,
+            "com.github.wez.wezterm": .wezterm,
+            "dev.commandline.waveterm": .wave,
+            "com.raphaelamorim.rio": .rio,
+            "org.tabby": .tabby,
+            "com.todesktop.230313mzl4w4u92": .cursor,
+            "co.zeit.hyper": .hyper,
         ]
 
         let runningApps = NSWorkspace.shared.runningApplications
@@ -146,67 +159,91 @@ enum TerminalAdapter {
         log("activateTerminal result: \(result)")
     }
 
-    /// Jump to heading by scrolling the terminal via Accessibility API
+    /// Scroll tier for each terminal type
+    enum ScrollTier {
+        case axScrollBar    // Tier A: native AX scroll bar (Terminal.app, iTerm2)
+        case cliIPC         // Tier B: terminal CLI/IPC (Kitty, WezTerm)
+        case keySimulation  // Tier C: CGEvent keyboard simulation (all others)
+    }
+
+    static func scrollTier(for terminalType: TerminalType) -> ScrollTier {
+        switch terminalType {
+        case .terminalApp, .iterm2:
+            return .axScrollBar
+        case .kitty, .wezterm:
+            return .cliIPC
+        case .ghostty, .alacritty, .warp, .rio, .cursor, .tabby, .hyper, .wave, .termius, .unknown:
+            return .keySimulation
+        }
+    }
+
+    /// Jump to heading — dispatches to the appropriate scroll method based on terminal type
     static func jumpToHeading(
         heading: TOCHeading,
         responseTerminalLines: Int,
-        app: NSRunningApplication
+        app: NSRunningApplication,
+        terminalType: TerminalType = .unknown
     ) {
         let pid = app.processIdentifier
-        log("jumpToHeading: '\(heading.title)' estLine=\(heading.estimatedTerminalLine) responseLines=\(responseTerminalLines) pid=\(pid)")
+        let tier = scrollTier(for: terminalType)
+        log("jumpToHeading: '\(heading.title)' estLine=\(heading.estimatedTerminalLine) responseLines=\(responseTerminalLines) pid=\(pid) tier=\(tier) terminal=\(terminalType.rawValue)")
 
-        // Activate terminal
         activateTerminal(app)
 
-        // Walk AX hierarchy: App → Window → ... → ScrollArea → TextArea + ScrollBar
+        switch tier {
+        case .axScrollBar:
+            jumpViaAXScrollBar(heading: heading, responseTerminalLines: responseTerminalLines, pid: pid)
+        case .cliIPC:
+            jumpViaCLI(heading: heading, responseTerminalLines: responseTerminalLines, terminalType: terminalType)
+        case .keySimulation:
+            jumpViaKeySimulation(heading: heading, responseTerminalLines: responseTerminalLines, pid: pid)
+        }
+    }
+
+    // MARK: - Tier A: AX ScrollBar
+
+    private static func jumpViaAXScrollBar(heading: TOCHeading, responseTerminalLines: Int, pid: Int32) {
         let axApp = AXUIElementCreateApplication(pid)
 
-        // Get focused window (or fall back to first window)
         var windowRef: CFTypeRef?
         if AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &windowRef) != .success {
-            log("jumpToHeading: failed to get focused window, trying windows list")
+            log("tierA: failed to get focused window, trying windows list")
             var windowsRef: CFTypeRef?
             guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef) == .success,
                   let windows = windowsRef as? [AXUIElement],
                   let firstWindow = windows.first else {
-                log("jumpToHeading: no windows found")
+                log("tierA: no windows found")
                 return
             }
             windowRef = firstWindow
         }
         let window = windowRef as! AXUIElement
 
-        // Find the AXScrollArea recursively
         guard let scrollArea = findAXElement(in: window, role: kAXScrollAreaRole as String) else {
-            log("jumpToHeading: no AXScrollArea found")
+            log("tierA: no AXScrollArea found")
             return
         }
 
-        // Get the AXTextArea inside the scroll area
         guard let textArea = findAXElement(in: scrollArea, role: kAXTextAreaRole as String) else {
-            log("jumpToHeading: no AXTextArea found")
+            log("tierA: no AXTextArea found")
             return
         }
 
-        // Get cursor line number (≈ total lines, since Claude just finished responding)
         var cursorLineRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(textArea, kAXInsertionPointLineNumberAttribute as CFString, &cursorLineRef) == .success,
               let cursorLine = (cursorLineRef as? NSNumber)?.intValue else {
-            log("jumpToHeading: failed to get AXInsertionPointLineNumber")
+            log("tierA: failed to get AXInsertionPointLineNumber")
             return
         }
-        log("jumpToHeading: cursorLine (total lines) = \(cursorLine)")
+        log("tierA: cursorLine (total lines) = \(cursorLine)")
 
-        // Get visible character range to determine visible rows
         var visRangeRef: CFTypeRef?
-        var visibleRows = 40 // fallback
+        var visibleRows = 40
         if AXUIElementCopyAttributeValue(textArea, kAXVisibleCharacterRangeAttribute as CFString, &visRangeRef) == .success {
             let visRange = visRangeRef as! AXValue
             var cfRange = CFRange(location: 0, length: 0)
             AXValueGetValue(visRange, .cfRange, &cfRange)
-            log("jumpToHeading: visibleCharRange location=\(cfRange.location) length=\(cfRange.length)")
 
-            // Use parameterized attribute to get line number for start and end of visible range
             let startIndex = cfRange.location
             let endIndex = cfRange.location + cfRange.length - 1
 
@@ -217,43 +254,148 @@ enum TerminalAdapter {
                let startLine = (startLineRef as? NSNumber)?.intValue,
                let endLine = (endLineRef as? NSNumber)?.intValue {
                 visibleRows = max(endLine - startLine, 1)
-                log("jumpToHeading: visibleRows = \(visibleRows) (lines \(startLine)...\(endLine))")
+                log("tierA: visibleRows = \(visibleRows) (lines \(startLine)...\(endLine))")
             }
         }
 
-        // Calculate target absolute line by detecting Claude UI chrome dynamically.
-        // After Claude responds, the terminal shows separator lines (─────) below the
-        // response. We search backwards from the cursor to find the first separator,
-        // which marks the boundary between response content and Claude's prompt UI.
         let claudeUIChrome = detectChromeLines(textArea: textArea, cursorLine: cursorLine)
         let responseEndLine = cursorLine - claudeUIChrome
         let headingAbsLine = responseEndLine - responseTerminalLines + heading.estimatedTerminalLine
-        log("jumpToHeading: responseEndLine=\(responseEndLine) headingAbsLine=\(headingAbsLine)")
+        log("tierA: responseEndLine=\(responseEndLine) headingAbsLine=\(headingAbsLine)")
 
-        // Scroll bar value: proportion of scroll position
-        // value = firstVisibleLine / (totalLines - visibleRows)
-        // We want heading at top of viewport, so firstVisibleLine = headingAbsLine
         let maxScrollLine = cursorLine - visibleRows
         guard maxScrollLine > 0 else {
-            log("jumpToHeading: content fits in viewport, no scroll needed")
+            log("tierA: content fits in viewport, no scroll needed")
             return
         }
 
         let scrollValue = Float(max(0, headingAbsLine)) / Float(maxScrollLine)
         let clampedValue = min(max(scrollValue, 0.0), 1.0)
-        log("jumpToHeading: scrollValue = \(headingAbsLine) / \(maxScrollLine) = \(scrollValue) → clamped \(clampedValue)")
+        log("tierA: scrollValue = \(headingAbsLine) / \(maxScrollLine) = \(scrollValue) → clamped \(clampedValue)")
 
-        // Get the vertical scroll bar
         var scrollBarRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(scrollArea, kAXVerticalScrollBarAttribute as CFString, &scrollBarRef) == .success else {
-            log("jumpToHeading: no vertical scroll bar found")
+            log("tierA: no vertical scroll bar found")
             return
         }
         let scrollBar = scrollBarRef as! AXUIElement
 
-        // Set the scroll position
         let result = AXUIElementSetAttributeValue(scrollBar, kAXValueAttribute as CFString, NSNumber(value: clampedValue) as CFTypeRef)
-        log("jumpToHeading: set scroll bar to \(clampedValue), result = \(result == .success ? "success" : "failed (\(result.rawValue))")")
+        log("tierA: set scroll bar to \(clampedValue), result = \(result == .success ? "success" : "failed (\(result.rawValue))")")
+    }
+
+    // MARK: - Tier B: CLI/IPC
+
+    private static func jumpViaCLI(heading: TOCHeading, responseTerminalLines: Int, terminalType: TerminalType) {
+        // Lines from the bottom of the response to the heading
+        let linesFromBottom = responseTerminalLines - heading.estimatedTerminalLine
+        // Add chrome lines (separator + prompt ≈ 4 lines)
+        let scrollUpLines = linesFromBottom + 4
+
+        switch terminalType {
+        case .kitty:
+            jumpViaKitty(scrollUpLines: scrollUpLines)
+        case .wezterm:
+            jumpViaWezTerm(scrollUpLines: scrollUpLines)
+        default:
+            log("tierB: unsupported terminal \(terminalType.rawValue)")
+        }
+    }
+
+    private static func jumpViaKitty(scrollUpLines: Int) {
+        // First scroll to bottom, then scroll up the exact number of lines
+        let scrollToEnd = Process()
+        scrollToEnd.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        scrollToEnd.arguments = ["kitten", "@", "scroll-window", "end"]
+        try? scrollToEnd.run()
+        scrollToEnd.waitUntilExit()
+
+        let scrollUp = Process()
+        scrollUp.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        scrollUp.arguments = ["kitten", "@", "scroll-window", "\(scrollUpLines)-"]
+        try? scrollUp.run()
+        scrollUp.waitUntilExit()
+        log("tierB/kitty: scrolled to end then up \(scrollUpLines) lines, exit=\(scrollUp.terminationStatus)")
+    }
+
+    private static func jumpViaWezTerm(scrollUpLines: Int) {
+        // WezTerm: scroll to bottom first via Cmd+End key sequence, then send PageUp escape sequences
+        // Use wezterm cli to send escape sequences
+        let scrollToEnd = Process()
+        scrollToEnd.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        scrollToEnd.arguments = ["wezterm", "cli", "send-text", "--no-paste", "\u{1b}[F"] // End key
+        try? scrollToEnd.run()
+        scrollToEnd.waitUntilExit()
+
+        // Send PageUp sequences — each PageUp scrolls ~viewport lines, estimate viewport as 40
+        let viewportRows = 40
+        let pageUps = max(1, (scrollUpLines + viewportRows / 2) / viewportRows)
+        for i in 0..<pageUps {
+            let pageUp = Process()
+            pageUp.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            pageUp.arguments = ["wezterm", "cli", "send-text", "--no-paste", "\u{1b}[5~"] // PageUp
+            try? pageUp.run()
+            pageUp.waitUntilExit()
+            if i < pageUps - 1 {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+        log("tierB/wezterm: sent \(pageUps) PageUp sequences for \(scrollUpLines) lines")
+    }
+
+    // MARK: - Tier C: CGEvent Key Simulation
+
+    private static func jumpViaKeySimulation(heading: TOCHeading, responseTerminalLines: Int, pid: Int32) {
+        let linesFromBottom = responseTerminalLines - heading.estimatedTerminalLine
+        let chromeLines = 4
+        let scrollUpLines = linesFromBottom + chromeLines
+
+        // Estimate visible rows from window height
+        let visibleRows = estimateVisibleRows(pid: pid)
+
+        // Step 1: Scroll to bottom with Cmd+End
+        sendKeyEvent(keyCode: 0x77, flags: .maskCommand, pid: pid) // End key
+        Thread.sleep(forTimeInterval: 0.1)
+
+        // Step 2: Send Shift+PageUp to scroll up
+        let pageUps = max(1, (scrollUpLines + visibleRows / 2) / visibleRows)
+        log("tierC: scrollUpLines=\(scrollUpLines) visibleRows=\(visibleRows) pageUps=\(pageUps)")
+
+        for i in 0..<pageUps {
+            sendKeyEvent(keyCode: 0x74, flags: .maskShift, pid: pid) // PageUp
+            if i < pageUps - 1 {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+        log("tierC: sent Cmd+End then \(pageUps)× Shift+PageUp")
+    }
+
+    private static func sendKeyEvent(keyCode: UInt16, flags: CGEventFlags, pid: Int32) {
+        guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
+            log("sendKeyEvent: failed to create CGEvent")
+            return
+        }
+        keyDown.flags = flags
+        keyUp.flags = flags
+        keyDown.postToPid(pid)
+        keyUp.postToPid(pid)
+    }
+
+    /// Estimate visible rows from the terminal window height
+    private static func estimateVisibleRows(pid: Int32) -> Int {
+        let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        for windowInfo in windowList {
+            guard let ownerPID = windowInfo[kCGWindowOwnerPID as String] as? Int32,
+                  ownerPID == pid,
+                  let bounds = windowInfo[kCGWindowBounds as String] as? [String: CGFloat],
+                  let h = bounds["Height"],
+                  h > 100 else { continue }
+            // Subtract title bar (~28px), estimate ~14px per row (monospace line height)
+            let rows = Int((h - 28) / 14)
+            return max(10, min(rows, 100))
+        }
+        return 40
     }
 
     // MARK: - Chrome detection

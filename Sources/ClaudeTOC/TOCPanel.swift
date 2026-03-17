@@ -538,7 +538,8 @@ class TOCSessionManager {
         TerminalAdapter.jumpToHeading(
             heading: heading,
             responseTerminalLines: tocResult.estimatedTerminalLines,
-            app: termApp
+            app: termApp,
+            terminalType: session.terminalType
         )
     }
 
@@ -552,28 +553,29 @@ class TOCSessionManager {
         TerminalAdapter.jumpToHeading(
             heading: startHeading,
             responseTerminalLines: tocResult.estimatedTerminalLines,
-            app: termApp
+            app: termApp,
+            terminalType: session.terminalType
         )
     }
 
     // MARK: - Notification
 
     private func sendNotification(for session: TOCSession) {
-        // Title: Responded "user query"
+        // Title: one line, keep it short
         let notifTitle: String
         if let q = session.tocResult?.lastUserQuery {
-            let maxLen = 40
-            let trimmed = q.replacingOccurrences(of: "\n", with: " ")
+            let maxLen = 25
+            let trimmed = q.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
             if trimmed.count <= maxLen {
-                notifTitle = "Responded \"\(trimmed)\""
+                notifTitle = "Re: \(trimmed)"
             } else {
-                notifTitle = "Responded \"\(trimmed.prefix(maxLen))…\""
+                notifTitle = "Re: \(trimmed.prefix(maxLen))…"
             }
         } else {
             notifTitle = "Claude responded"
         }
-        // Body: first line of the latest response
-        let notifBody = session.tocResult?.responsePreview ?? "New response"
+        // Body: up to 2 lines of response preview
+        let notifBody = session.tocResult?.responsePreview ?? ""
 
         if notificationAuthorized {
             let content = UNMutableNotificationContent()
