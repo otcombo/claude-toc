@@ -81,6 +81,14 @@ ln -s /Applications "$DMG_STAGING/Applications"
 hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$DMG_STAGING" -ov -format UDZO "$DMG_PATH" 2>&1
 rm -rf "$DMG_STAGING"
 
+# Create ZIP for auto-updater
+ZIP_PATH="${DMG_DIR}/TOC.for.Claude.Code.app.zip"
+rm -f "$ZIP_PATH"
+cd "$DMG_DIR"
+ditto -c -k --keepParent "${DISPLAY_NAME}.app" "$ZIP_PATH"
+cd "$SCRIPT_DIR"
+
 echo ""
 echo "App: ${APP_DIR}"
 echo "DMG: ${DMG_PATH}"
+echo "ZIP: ${ZIP_PATH}"
