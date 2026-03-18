@@ -39,9 +39,21 @@ if [ -d "$ICON_FILE" ]; then
     rm -rf "$ACTOOL_OUT"
     echo "Compiled .icon → Assets.car"
 fi
-# Legacy .icns for older macOS
-if [ -f "AppIcon.icns" ]; then
-    cat AppIcon.icns > "${STAGE_APP}/Contents/Resources/AppIcon.icns"
+# Generate traditional .icns from PNG for notification icon support
+ICON_PNG="Sources/ClaudeTOC/appicon64@3x.png"
+if [ -f "$ICON_PNG" ]; then
+    ICONSET=$(mktemp -d)/appicon.iconset
+    mkdir -p "$ICONSET"
+    for SIZE in 16 32 64 128; do
+        sips -z $SIZE $SIZE "$ICON_PNG" --out "$ICONSET/icon_${SIZE}x${SIZE}.png" >/dev/null 2>&1
+    done
+    SIZE2X=32; sips -z $SIZE2X $SIZE2X "$ICON_PNG" --out "$ICONSET/icon_16x16@2x.png" >/dev/null 2>&1
+    SIZE2X=64; sips -z $SIZE2X $SIZE2X "$ICON_PNG" --out "$ICONSET/icon_32x32@2x.png" >/dev/null 2>&1
+    SIZE2X=128; sips -z $SIZE2X $SIZE2X "$ICON_PNG" --out "$ICONSET/icon_64x64@2x.png" >/dev/null 2>&1
+    # Use 192px source as-is for 128@2x (closest to 256)
+    cp "$ICON_PNG" "$ICONSET/icon_128x128@2x.png"
+    iconutil -c icns -o "${STAGE_APP}/Contents/Resources/appicon.icns" "$ICONSET" 2>&1 || true
+    rm -rf "$(dirname "$ICONSET")"
 fi
 
 # Sign the app with developer certificate (stable identity preserves TCC permissions across rebuilds)

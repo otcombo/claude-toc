@@ -280,8 +280,8 @@ enum TerminalAdapter {
             return
         }
 
-        // Offset by 2 lines so the heading is visible below the top edge
-        let scrollValue = Float(max(0, targetLine - 2)) / Float(maxScrollLine)
+        // Offset by 1 line so the heading appears near the top with just the blank line above
+        let scrollValue = Float(max(0, targetLine - 1)) / Float(maxScrollLine)
         let clampedValue = min(max(scrollValue, 0.0), 1.0)
         log("tierA: scrollValue = \(targetLine) / \(maxScrollLine) = \(clampedValue)")
 
@@ -429,8 +429,8 @@ enum TerminalAdapter {
             if let range = fullText.range(of: searchPattern, options: .backwards) {
                 let textAfterMatch = fullText[range.lowerBound...]
                 let linesFromBottom = textAfterMatch.components(separatedBy: "\n").count - 1
-                // +2 offset so heading appears below the top edge of viewport
-                let adjusted = max(0, linesFromBottom + 2)
+                // +1 offset so heading appears near the top with just the blank line above
+                let adjusted = max(0, linesFromBottom + 1)
                 log("tierB/textSearch: found '\(heading.title)' at \(linesFromBottom) lines from bottom → \(adjusted)")
                 return adjusted
             }

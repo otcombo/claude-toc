@@ -561,16 +561,12 @@ class TOCSessionManager {
     // MARK: - Notification
 
     private func sendNotification(for session: TOCSession) {
-        // Title: one line, keep it short
+        // Title: one line, keep it short (max ~30 display columns including "Re: " prefix)
         let notifTitle: String
         if let q = session.tocResult?.lastUserQuery {
-            let maxLen = 25
             let trimmed = q.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
-            if trimmed.count <= maxLen {
-                notifTitle = "Re: \(trimmed)"
-            } else {
-                notifTitle = "Re: \(trimmed.prefix(maxLen))…"
-            }
+            // "Re: " takes 4 columns, leave 26 for the query text
+            notifTitle = "Re: \(TOCParser.truncateToDisplayWidth(trimmed, maxWidth: 26))"
         } else {
             notifTitle = "Claude responded"
         }
