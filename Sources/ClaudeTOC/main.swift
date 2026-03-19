@@ -112,20 +112,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // This is called if we ever need a non-relaunch completion path
         }
 
-        let hostingView = NSHostingView(rootView: onboardingView)
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 460),
-            styleMask: [.borderless, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        window.contentView = hostingView
+        let hostingController = NSHostingController(rootView: onboardingView)
+        let window = NSWindow(contentViewController: hostingController)
+        window.styleMask = [.titled, .closable, .fullSizeContentView]
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = false
-        window.isMovableByWindowBackground = true
         window.level = .floating
+        window.setContentSize(NSSize(width: 520, height: 450))
         window.center()
+        window.isReleasedWhenClosed = false
+        window.standardWindowButton(.closeButton)?.isHidden = true
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
+        window.isMovableByWindowBackground = true
         window.makeKeyAndOrderFront(nil)
 
         // Bring app to front for onboarding
