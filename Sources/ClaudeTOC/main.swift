@@ -53,7 +53,7 @@ if let path = transcriptPath {
 
     // Socket failed — check if another instance is running (Apple-standard approach).
     // This handles the race where another instance just launched but its socket isn't ready yet.
-    let bundleId = Bundle.main.bundleIdentifier ?? "com.otcombo.claude-toc"
+    let bundleId = Bundle.main.bundleIdentifier ?? "com.otcombo.claudetoc"
     let myPid = ProcessInfo.processInfo.processIdentifier
     let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
         .filter { $0.processIdentifier != myPid }

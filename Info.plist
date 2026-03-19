@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.otcombo.claude-toc</string>
+    <string>com.otcombo.claudetoc</string>
     <key>CFBundleName</key>
     <string>TOC for Claude Code</string>
     <key>CFBundleDisplayName</key>
