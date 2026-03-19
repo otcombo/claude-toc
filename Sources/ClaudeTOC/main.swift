@@ -171,6 +171,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+// Hold a strong reference — NSApplication.delegate is weak and would otherwise let AppDelegate
+// (and its MenuBarController/statusItem) get deallocated by ARC.
 let delegate = AppDelegate()
 app.delegate = delegate
-app.run()
+withExtendedLifetime(delegate) {
+    app.run()
+}
