@@ -85,19 +85,21 @@ class TOCSession {
     let tocResult: TOCResult?
     let terminalType: TerminalType
     let terminalApp: NSRunningApplication?
+    let terminalRows: Int?           // actual terminal rows from tty (for scroll calculation)
     var axWindow: AXUIElement?       // the specific terminal window at hook time
     var windowID: CGWindowID?        // stable window identifier for matching
     var panel: TOCPanel?
 
     init(id: String, transcriptPath: String, projectName: String?, tocResult: TOCResult?,
          terminalType: TerminalType, terminalApp: NSRunningApplication?,
-         axWindow: AXUIElement? = nil, windowID: CGWindowID? = nil) {
+         terminalRows: Int? = nil, axWindow: AXUIElement? = nil, windowID: CGWindowID? = nil) {
         self.id = id
         self.transcriptPath = transcriptPath
         self.projectName = projectName
         self.tocResult = tocResult
         self.terminalType = terminalType
         self.terminalApp = terminalApp
+        self.terminalRows = terminalRows
         self.axWindow = axWindow
         self.windowID = windowID
     }
@@ -144,7 +146,7 @@ class TOCSessionManager {
         Array(sessions.values).sorted { $0.id < $1.id }
     }
 
-    func addSession(transcriptPath: String, hookPid: Int32?, terminalBundleId: String? = nil, terminalColumns: Int? = nil, tty: String? = nil, windowId: UInt32? = nil) {
+    func addSession(transcriptPath: String, hookPid: Int32?, terminalBundleId: String? = nil, terminalColumns: Int? = nil, terminalRows: Int? = nil, tty: String? = nil, windowId: UInt32? = nil) {
         let sessionId = URL(fileURLWithPath: transcriptPath).deletingPathExtension().lastPathComponent
         let projectName = Self.extractProjectName(from: transcriptPath)
 
@@ -206,7 +208,7 @@ class TOCSessionManager {
                             sessionId: sessionId, transcriptPath: transcriptPath,
                             projectName: projectName, tocResult: result,
                             terminalType: capturedTerminalType, terminalApp: capturedTerminalApp,
-                            axWindow: capturedAxWindow, windowID: capturedWindowID
+                            terminalRows: terminalRows, axWindow: capturedAxWindow, windowID: capturedWindowID
                         )
                         return
                     }
@@ -218,7 +220,7 @@ class TOCSessionManager {
                     sessionId: sessionId, transcriptPath: transcriptPath,
                     projectName: projectName, tocResult: finalResult,
                     terminalType: capturedTerminalType, terminalApp: capturedTerminalApp,
-                    axWindow: capturedAxWindow, windowID: capturedWindowID
+                    terminalRows: terminalRows, axWindow: capturedAxWindow, windowID: capturedWindowID
                 )
             }
             return
@@ -230,14 +232,15 @@ class TOCSessionManager {
             sessionId: sessionId, transcriptPath: transcriptPath,
             projectName: projectName, tocResult: tocResult,
             terminalType: terminalType, terminalApp: terminalApp,
-            axWindow: axWindow, windowID: windowID
+            terminalRows: terminalRows, axWindow: axWindow, windowID: windowID
         )
     }
 
     private func finalizeSession(
         sessionId: String, transcriptPath: String, projectName: String?,
         tocResult: TOCResult?, terminalType: TerminalType,
-        terminalApp: NSRunningApplication?, axWindow: AXUIElement?, windowID: CGWindowID?
+        terminalApp: NSRunningApplication?, terminalRows: Int? = nil,
+        axWindow: AXUIElement?, windowID: CGWindowID?
     ) {
         // Close existing panel for this session
         sessions[sessionId]?.panel?.close()
@@ -245,7 +248,7 @@ class TOCSessionManager {
         let session = TOCSession(
             id: sessionId, transcriptPath: transcriptPath, projectName: projectName,
             tocResult: tocResult, terminalType: terminalType, terminalApp: terminalApp,
-            axWindow: axWindow, windowID: windowID
+            terminalRows: terminalRows, axWindow: axWindow, windowID: windowID
         )
 
         // Show TOC panel only if there are headings
@@ -539,7 +542,8 @@ class TOCSessionManager {
             heading: heading,
             responseTerminalLines: tocResult.estimatedTerminalLines,
             app: termApp,
-            terminalType: session.terminalType
+            terminalType: session.terminalType,
+            terminalRows: session.terminalRows
         )
     }
 
@@ -554,7 +558,8 @@ class TOCSessionManager {
             heading: startHeading,
             responseTerminalLines: tocResult.estimatedTerminalLines,
             app: termApp,
-            terminalType: session.terminalType
+            terminalType: session.terminalType,
+            terminalRows: session.terminalRows
         )
     }
 

@@ -7,6 +7,7 @@ var transcriptPath: String?
 var hookPid: Int32?
 var terminalBundleId: String?
 var terminalColumns: Int?
+var terminalRows: Int?
 var hookTty: String?
 var hookWindowId: UInt32?
 
@@ -22,6 +23,9 @@ while argIdx < cliArgs.count {
         argIdx += 2
     } else if cliArgs[argIdx] == "--terminal-columns", argIdx + 1 < cliArgs.count {
         terminalColumns = Int(cliArgs[argIdx + 1])
+        argIdx += 2
+    } else if cliArgs[argIdx] == "--terminal-rows", argIdx + 1 < cliArgs.count {
+        terminalRows = Int(cliArgs[argIdx + 1])
         argIdx += 2
     } else if cliArgs[argIdx] == "--tty", argIdx + 1 < cliArgs.count {
         hookTty = cliArgs[argIdx + 1]
@@ -41,7 +45,7 @@ if let first = positional.first {
 
 // Try sending to a running instance BEFORE starting NSApplication
 if let path = transcriptPath {
-    let msg = IPCMessage(transcriptPath: path, hookPid: hookPid, terminalBundleId: terminalBundleId, terminalColumns: terminalColumns, tty: hookTty, windowId: hookWindowId)
+    let msg = IPCMessage(transcriptPath: path, hookPid: hookPid, terminalBundleId: terminalBundleId, terminalColumns: terminalColumns, terminalRows: terminalRows, tty: hookTty, windowId: hookWindowId)
     if SocketClient.send(message: msg) {
         // Successfully sent to running instance — just exit
         exit(0)
@@ -153,14 +157,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         socketServer = SocketServer { [weak self] msg in
             DispatchQueue.main.async {
-                self?.sessionManager.addSession(transcriptPath: msg.transcriptPath, hookPid: msg.hookPid, terminalBundleId: msg.terminalBundleId, terminalColumns: msg.terminalColumns, tty: msg.tty, windowId: msg.windowId)
+                self?.sessionManager.addSession(transcriptPath: msg.transcriptPath, hookPid: msg.hookPid, terminalBundleId: msg.terminalBundleId, terminalColumns: msg.terminalColumns, terminalRows: msg.terminalRows, tty: msg.tty, windowId: msg.windowId)
             }
         }
         socketServer?.start()
 
         // Handle the initial transcript that started us
         if let path = transcriptPath {
-            sessionManager.addSession(transcriptPath: path, hookPid: hookPid, terminalBundleId: terminalBundleId, terminalColumns: terminalColumns, tty: hookTty, windowId: hookWindowId)
+            sessionManager.addSession(transcriptPath: path, hookPid: hookPid, terminalBundleId: terminalBundleId, terminalColumns: terminalColumns, terminalRows: terminalRows, tty: hookTty, windowId: hookWindowId)
         }
     }
 }

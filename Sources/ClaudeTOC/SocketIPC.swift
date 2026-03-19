@@ -6,6 +6,7 @@ struct IPCMessage: Codable, Sendable {
     let hookPid: Int32?
     let terminalBundleId: String?
     let terminalColumns: Int?
+    let terminalRows: Int?
     let tty: String?
     let windowId: UInt32?
 }

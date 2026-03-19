@@ -75,11 +75,17 @@ if [ "${TERM_PROGRAM:-}" = "vscode" ] && [ -z "$TERMINAL_BUNDLE_ID" ]; then
     done
 fi
 
-# Get actual terminal columns (much more accurate than pixel estimation)
-TERM_COLS=$(tput cols 2>/dev/null || echo "")
-
 # Get TTY device for window matching (use parent's tty since our stdin is a pipe)
 HOOK_TTY=$(ps -o tty= -p $CALLER_PID 2>/dev/null | tr -d ' ')
+
+# Get actual terminal dimensions via the real tty (hook's stdin is a pipe, so tput returns defaults)
+if [ -n "$HOOK_TTY" ] && [ -e "/dev/$HOOK_TTY" ]; then
+    TERM_COLS=$(stty -f "/dev/$HOOK_TTY" size 2>/dev/null | awk '{print $2}')
+    TERM_ROWS=$(stty -f "/dev/$HOOK_TTY" size 2>/dev/null | awk '{print $1}')
+else
+    TERM_COLS=$(tput cols 2>/dev/null || echo "")
+    TERM_ROWS=""
+fi
 
 # Resolve TTY → Terminal.app window ID via AppleScript (hook runs in Terminal's context, has permission)
 WINDOW_ID=""
@@ -101,6 +107,7 @@ fi
 ARGS=("$TRANSCRIPT_PATH" --hook-pid "$CALLER_PID")
 [ -n "$TERMINAL_BUNDLE_ID" ] && ARGS+=(--terminal-bundle-id "$TERMINAL_BUNDLE_ID")
 [ -n "$TERM_COLS" ] && ARGS+=(--terminal-columns "$TERM_COLS")
+[ -n "$TERM_ROWS" ] && ARGS+=(--terminal-rows "$TERM_ROWS")
 [ -n "$HOOK_TTY" ] && ARGS+=(--tty "$HOOK_TTY")
 [ -n "$WINDOW_ID" ] && ARGS+=(--window-id "$WINDOW_ID")
 
