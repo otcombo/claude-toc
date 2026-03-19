@@ -7,6 +7,7 @@ var transcriptPath: String?
 var hookPid: Int32?
 var terminalBundleId: String?
 var terminalColumns: Int?
+var terminalRows: Int?
 var hookTty: String?
 var hookWindowId: UInt32?
 
@@ -22,6 +23,9 @@ while argIdx < cliArgs.count {
         argIdx += 2
     } else if cliArgs[argIdx] == "--terminal-columns", argIdx + 1 < cliArgs.count {
         terminalColumns = Int(cliArgs[argIdx + 1])
+        argIdx += 2
+    } else if cliArgs[argIdx] == "--terminal-rows", argIdx + 1 < cliArgs.count {
+        terminalRows = Int(cliArgs[argIdx + 1])
         argIdx += 2
     } else if cliArgs[argIdx] == "--tty", argIdx + 1 < cliArgs.count {
         hookTty = cliArgs[argIdx + 1]
@@ -41,7 +45,7 @@ if let first = positional.first {
 
 // Try sending to a running instance BEFORE starting NSApplication
 if let path = transcriptPath {
-    let msg = IPCMessage(transcriptPath: path, hookPid: hookPid, terminalBundleId: terminalBundleId, terminalColumns: terminalColumns, tty: hookTty, windowId: hookWindowId)
+    let msg = IPCMessage(transcriptPath: path, hookPid: hookPid, terminalBundleId: terminalBundleId, terminalColumns: terminalColumns, terminalRows: terminalRows, tty: hookTty, windowId: hookWindowId)
     if SocketClient.send(message: msg) {
         // Successfully sent to running instance — just exit
         exit(0)
@@ -49,7 +53,7 @@ if let path = transcriptPath {
 
     // Socket failed — check if another instance is running (Apple-standard approach).
     // This handles the race where another instance just launched but its socket isn't ready yet.
-    let bundleId = Bundle.main.bundleIdentifier ?? "com.otcombo.claude-toc"
+    let bundleId = Bundle.main.bundleIdentifier ?? "com.otcombo.claudetoc"
     let myPid = ProcessInfo.processInfo.processIdentifier
     let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
         .filter { $0.processIdentifier != myPid }
@@ -108,20 +112,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // This is called if we ever need a non-relaunch completion path
         }
 
-        let hostingView = NSHostingView(rootView: onboardingView)
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 460),
-            styleMask: [.borderless, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        window.contentView = hostingView
+        let hostingController = NSHostingController(rootView: onboardingView)
+        let window = NSWindow(contentViewController: hostingController)
+        window.styleMask = [.titled, .closable, .fullSizeContentView]
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = false
-        window.isMovableByWindowBackground = true
         window.level = .floating
+        window.setContentSize(NSSize(width: 520, height: 450))
         window.center()
+        window.isReleasedWhenClosed = false
+        window.standardWindowButton(.closeButton)?.isHidden = true
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
+        window.isMovableByWindowBackground = true
         window.makeKeyAndOrderFront(nil)
 
         // Bring app to front for onboarding
@@ -153,20 +159,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         socketServer = SocketServer { [weak self] msg in
             DispatchQueue.main.async {
-                self?.sessionManager.addSession(transcriptPath: msg.transcriptPath, hookPid: msg.hookPid, terminalBundleId: msg.terminalBundleId, terminalColumns: msg.terminalColumns, tty: msg.tty, windowId: msg.windowId)
+                self?.sessionManager.addSession(transcriptPath: msg.transcriptPath, hookPid: msg.hookPid, terminalBundleId: msg.terminalBundleId, terminalColumns: msg.terminalColumns, terminalRows: msg.terminalRows, tty: msg.tty, windowId: msg.windowId)
             }
         }
         socketServer?.start()
 
         // Handle the initial transcript that started us
         if let path = transcriptPath {
-            sessionManager.addSession(transcriptPath: path, hookPid: hookPid, terminalBundleId: terminalBundleId, terminalColumns: terminalColumns, tty: hookTty, windowId: hookWindowId)
+            sessionManager.addSession(transcriptPath: path, hookPid: hookPid, terminalBundleId: terminalBundleId, terminalColumns: terminalColumns, terminalRows: terminalRows, tty: hookTty, windowId: hookWindowId)
         }
     }
 }
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+// Hold a strong reference — NSApplication.delegate is weak and would otherwise let AppDelegate
+// (and its MenuBarController/statusItem) get deallocated by ARC.
 let delegate = AppDelegate()
 app.delegate = delegate
-app.run()
+withExtendedLifetime(delegate) {
+    app.run()
+}

@@ -91,19 +91,15 @@ enum TOCParser {
             }
         }
 
-        // Build response preview: up to 2 meaningful lines, each capped at 40 chars
+        // Build response preview: up to 2 meaningful lines, each capped at 40 display columns
+        // (CJK chars count as 2 columns to fit macOS notification banner width)
         let allPreviewLines = tocText.components(separatedBy: "\n")
         var previewCollected: [String] = []
         for pLine in allPreviewLines {
             guard previewCollected.count < 2 else { break }
             let trimmed = pLine.trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty || trimmed.hasPrefix("#") || trimmed.hasPrefix("```") { continue }
-            let maxLen = 40
-            if trimmed.count <= maxLen {
-                previewCollected.append(trimmed)
-            } else {
-                previewCollected.append(String(trimmed.prefix(maxLen)) + "…")
-            }
+            previewCollected.append(truncateToDisplayWidth(trimmed, maxWidth: 40))
         }
         let responsePreview: String? = previewCollected.isEmpty ? nil : previewCollected.joined(separator: "\n")
 
@@ -151,6 +147,35 @@ enum TOCParser {
         return result
     }
 
+    /// Truncate a string to fit within a given display width (CJK = 2 columns each).
+    /// Returns the truncated string with "…" appended if truncation occurred.
+    static func truncateToDisplayWidth(_ text: String, maxWidth: Int) -> String {
+        var width = 0
+        var endIndex = text.endIndex
+        for (i, scalar) in zip(text.indices, text.unicodeScalars) {
+            let charWidth = isCJK(scalar) ? 2 : 1
+            if width + charWidth > maxWidth {
+                endIndex = i
+                break
+            }
+            width += charWidth
+        }
+        if endIndex == text.endIndex {
+            return text
+        }
+        return String(text[text.startIndex..<endIndex]) + "…"
+    }
+
+    /// Check if a Unicode scalar is a CJK wide character
+    private static func isCJK(_ scalar: Unicode.Scalar) -> Bool {
+        let v = scalar.value
+        return (v >= 0x2E80 && v <= 0x9FFF) ||
+               (v >= 0xF900 && v <= 0xFAFF) ||
+               (v >= 0xFE30 && v <= 0xFE4F) ||
+               (v >= 0xFF00 && v <= 0xFF60) ||
+               (v >= 0x20000 && v <= 0x2FA1F)
+    }
+
     /// Estimate how many terminal lines a single markdown line occupies
     private static func estimateRenderedLines(_ line: String, columns: Int) -> Int {
         if line.isEmpty { return 1 } // empty line still takes 1 row
@@ -158,17 +183,7 @@ enum TOCParser {
         // Calculate display width (CJK characters = 2 columns, others = 1)
         var displayWidth = 0
         for scalar in line.unicodeScalars {
-            let v = scalar.value
-            // CJK Unified Ideographs, CJK symbols, fullwidth forms, etc.
-            if (v >= 0x2E80 && v <= 0x9FFF) ||
-               (v >= 0xF900 && v <= 0xFAFF) ||
-               (v >= 0xFE30 && v <= 0xFE4F) ||
-               (v >= 0xFF00 && v <= 0xFF60) ||
-               (v >= 0x20000 && v <= 0x2FA1F) {
-                displayWidth += 2
-            } else {
-                displayWidth += 1
-            }
+            displayWidth += isCJK(scalar) ? 2 : 1
         }
 
         return max(1, Int(ceil(Double(displayWidth) / Double(columns))))

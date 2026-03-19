@@ -39,9 +39,13 @@ if [ -d "$ICON_FILE" ]; then
     rm -rf "$ACTOOL_OUT"
     echo "Compiled .icon → Assets.car"
 fi
-# Legacy .icns for older macOS
+# Copy pre-built .icns for notification icon support
 if [ -f "AppIcon.icns" ]; then
-    cat AppIcon.icns > "${STAGE_APP}/Contents/Resources/AppIcon.icns"
+    cp "AppIcon.icns" "${STAGE_APP}/Contents/Resources/appicon.icns"
+fi
+# Copy app icon PNG for onboarding
+if [ -f "Sources/ClaudeTOC/appicon64@3x.png" ]; then
+    cp "Sources/ClaudeTOC/appicon64@3x.png" "${STAGE_APP}/Contents/Resources/appicon64@3x.png"
 fi
 
 # Sign the app with developer certificate (stable identity preserves TCC permissions across rebuilds)
