@@ -138,6 +138,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func startNormally() {
+        // Silently install Claude Code Stop hook
+        installClaudeHookIfNeeded()
+
         // Request notification authorization once at startup
         sessionManager.requestNotificationAuthorization()
 
@@ -167,6 +170,71 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Handle the initial transcript that started us
         if let path = transcriptPath {
             sessionManager.addSession(transcriptPath: path, hookPid: hookPid, terminalBundleId: terminalBundleId, terminalColumns: terminalColumns, terminalRows: terminalRows, tty: hookTty, windowId: hookWindowId)
+        }
+    }
+
+    /// Install Claude Code Stop hook into ~/.claude/settings.json
+    private func installClaudeHookIfNeeded() {
+        guard let hookScript = Bundle.main.url(forResource: "hook", withExtension: "sh") else {
+            log("hook.sh not found in bundle")
+            return
+        }
+        let hookPath = hookScript.path
+
+        let claudeDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
+        let settingsURL = claudeDir.appendingPathComponent("settings.json")
+
+        // Read existing settings or start fresh
+        var settings: [String: Any] = [:]
+        if let data = try? Data(contentsOf: settingsURL),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            settings = json
+        }
+
+        // Check existing Stop hooks — update stale path or skip if already correct
+        var hooks = settings["hooks"] as? [String: Any] ?? [:]
+        var stopHooks = hooks["Stop"] as? [[String: Any]] ?? []
+        var found = false
+
+        for i in stopHooks.indices {
+            guard var innerHooks = stopHooks[i]["hooks"] as? [[String: Any]] else { continue }
+            for j in innerHooks.indices {
+                guard let cmd = innerHooks[j]["command"] as? String else { continue }
+                if cmd == hookPath {
+                    return // already installed with correct path
+                }
+                // Recognize our hook by filename pattern (hook.sh inside a ClaudeTOC/TOC app bundle or old project path)
+                if cmd.contains("hook.sh") && (cmd.contains("ClaudeTOC") || cmd.contains("TOC for Claude Code") || cmd.contains("claude-toc")) {
+                    innerHooks[j]["command"] = hookPath
+                    stopHooks[i]["hooks"] = innerHooks
+                    found = true
+                }
+            }
+        }
+
+        if !found {
+            // Append new entry
+            let hookEntry: [String: Any] = [
+                "hooks": [[
+                    "type": "command",
+                    "command": hookPath,
+                    "async": true
+                ]]
+            ]
+            stopHooks.append(hookEntry)
+        }
+
+        hooks["Stop"] = stopHooks
+        settings["hooks"] = hooks
+
+        // Write back
+        do {
+            try FileManager.default.createDirectory(at: claudeDir, withIntermediateDirectories: true)
+            let data = try JSONSerialization.data(withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: settingsURL, options: .atomic)
+            log("Installed Claude Code Stop hook: \(hookPath)")
+        } catch {
+            log("Failed to install hook: \(error)")
         }
     }
 }

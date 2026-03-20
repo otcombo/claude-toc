@@ -32,6 +32,9 @@ fi
 if [ -f "Sources/ClaudeTOC/appicon64@3x.png" ]; then
     cp "Sources/ClaudeTOC/appicon64@3x.png" "${STAGE_APP}/Contents/Resources/appicon64@3x.png"
 fi
+# Copy hook script
+cp hook.sh "${STAGE_APP}/Contents/Resources/hook.sh"
+chmod +x "${STAGE_APP}/Contents/Resources/hook.sh"
 
 # Sign the app with developer certificate (stable identity preserves TCC permissions across rebuilds)
 SIGN_HASH=$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | grep -v REVOKED | head -1 | awk '{print $2}')
