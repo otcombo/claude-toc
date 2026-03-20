@@ -26,7 +26,7 @@ struct TOCView: View {
                         .foregroundStyle(.secondary)
                         .frame(width: 20, height: 20)
                         .contentShape(Circle())
-                        .glassEffect(.regular.interactive(), in: .circle)
+                        .adaptiveGlass(.regular, shape: .circle)
                 }
                 .buttonStyle(NoFeedbackButtonStyle())
                 .onHover { inside in
@@ -61,15 +61,13 @@ struct TOCView: View {
                 .background(HorizontalBounceFixer())
             }
             .frame(maxWidth: .infinity)
-            .scrollBounceBehavior(.basedOnSize, axes: .vertical)
+            .compatScrollBounce()
         }
         .frame(width: 180)
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxHeight: 300)
         .padding(.bottom, 12)
-        .background(colorScheme == .light ? Color.white.opacity(0.25) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 24))
-        .glassEffect(.clear, in: .rect(cornerRadius: 24))
+        .adaptiveGlass(.panel, colorScheme: colorScheme)
     }
 
     private var minLevel: Int {
@@ -120,6 +118,47 @@ struct TOCView: View {
         case 1: return .semibold
         case 2: return .medium
         default: return .regular
+        }
+    }
+}
+
+// MARK: - Glass Effect Compatibility
+
+enum AdaptiveGlassStyle {
+    case regular  // close button
+    case panel    // full panel background
+}
+
+extension View {
+    @ViewBuilder
+    func adaptiveGlass(_ style: AdaptiveGlassStyle, shape: some InsettableShape = RoundedRectangle(cornerRadius: 24), colorScheme: ColorScheme = .dark) -> some View {
+        if #available(macOS 26, *) {
+            switch style {
+            case .regular:
+                self.glassEffect(.regular.interactive(), in: .circle)
+            case .panel:
+                self.background(colorScheme == .light ? Color.white.opacity(0.25) : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 24))
+                    .glassEffect(.clear, in: .rect(cornerRadius: 24))
+            }
+        } else {
+            switch style {
+            case .regular:
+                self.background(.ultraThinMaterial, in: Circle())
+            case .panel:
+                self.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24))
+            }
+        }
+    }
+}
+
+extension View {
+    @ViewBuilder
+    func compatScrollBounce() -> some View {
+        if #available(macOS 13.3, *) {
+            self.scrollBounceBehavior(.basedOnSize, axes: .vertical)
+        } else {
+            self
         }
     }
 }

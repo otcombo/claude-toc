@@ -24,22 +24,7 @@ mkdir -p "${STAGE_APP}/Contents/MacOS" "${STAGE_APP}/Contents/Resources"
 cat "$BINARY" > "${STAGE_APP}/Contents/MacOS/${BINARY_NAME}"
 chmod +x "${STAGE_APP}/Contents/MacOS/${BINARY_NAME}"
 cat Info.plist > "${STAGE_APP}/Contents/Info.plist"
-# Compile .icon to Assets.car for macOS 26 Liquid Glass icon
-ICON_FILE="Sources/ClaudeTOC/appicon.icon"
-if [ -d "$ICON_FILE" ]; then
-    ACTOOL_OUT=$(mktemp -d)
-    xcrun actool "$ICON_FILE" --compile "${STAGE_APP}/Contents/Resources" \
-        --output-format human-readable-text \
-        --output-partial-info-plist "${ACTOOL_OUT}/assetcatalog_generated_info.plist" \
-        --app-icon appicon --include-all-app-icons \
-        --enable-on-demand-resources NO \
-        --target-device mac \
-        --minimum-deployment-target 13.0 \
-        --platform macosx 2>&1 || true
-    rm -rf "$ACTOOL_OUT"
-    echo "Compiled .icon → Assets.car"
-fi
-# Copy pre-built .icns for notification icon support
+# Copy .icns for app icon
 if [ -f "AppIcon.icns" ]; then
     cp "AppIcon.icns" "${STAGE_APP}/Contents/Resources/appicon.icns"
 fi
