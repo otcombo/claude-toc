@@ -220,7 +220,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let hookEntry: [String: Any] = [
                 "hooks": [[
                     "type": "command",
-                    "command": quotedHookPath
+                    "command": quotedHookPath,
+                    "async": true
                 ]]
             ]
             stopHooks.append(hookEntry)
