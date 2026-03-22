@@ -196,16 +196,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var stopHooks = hooks["Stop"] as? [[String: Any]] ?? []
         var found = false
 
+        // Shell-quote the path so spaces in .app names don't break execution
+        let quotedHookPath = "'\(hookPath)'"
+
         for i in stopHooks.indices {
             guard var innerHooks = stopHooks[i]["hooks"] as? [[String: Any]] else { continue }
             for j in innerHooks.indices {
                 guard let cmd = innerHooks[j]["command"] as? String else { continue }
-                if cmd == hookPath {
+                if cmd == quotedHookPath {
                     return // already installed with correct path
                 }
                 // Recognize our hook by filename pattern (hook.sh inside a ClaudeTOC/TOC app bundle or old project path)
                 if cmd.contains("hook.sh") && (cmd.contains("ClaudeTOC") || cmd.contains("TOC for Claude Code") || cmd.contains("claude-toc")) {
-                    innerHooks[j]["command"] = hookPath
+                    innerHooks[j]["command"] = quotedHookPath
                     stopHooks[i]["hooks"] = innerHooks
                     found = true
                 }
@@ -217,7 +220,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let hookEntry: [String: Any] = [
                 "hooks": [[
                     "type": "command",
-                    "command": hookPath,
+                    "command": quotedHookPath,
                     "async": true
                 ]]
             ]
