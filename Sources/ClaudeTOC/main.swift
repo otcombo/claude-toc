@@ -191,38 +191,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             settings = json
         }
 
-        // Check existing Stop hooks — update stale path or skip if already correct
+        // Check existing Stop hooks — update stale path or add new
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
         var stopHooks = hooks["Stop"] as? [[String: Any]] ?? []
-        var found = false
 
-        for i in stopHooks.indices {
-            guard var innerHooks = stopHooks[i]["hooks"] as? [[String: Any]] else { continue }
-            for j in innerHooks.indices {
-                guard let cmd = innerHooks[j]["command"] as? String else { continue }
-                if cmd == hookPath {
-                    return // already installed with correct path
-                }
-                // Recognize our hook by filename pattern (hook.sh inside a ClaudeTOC/TOC app bundle or old project path)
-                if cmd.contains("hook.sh") && (cmd.contains("ClaudeTOC") || cmd.contains("TOC for Claude Code") || cmd.contains("claude-toc")) {
-                    innerHooks[j]["command"] = hookPath
-                    stopHooks[i]["hooks"] = innerHooks
-                    found = true
-                }
+        // Remove any existing ClaudeTOC hook entries (stale or current)
+        stopHooks.removeAll { entry in
+            guard let innerHooks = entry["hooks"] as? [[String: Any]] else { return false }
+            return innerHooks.contains { h in
+                guard let cmd = h["command"] as? String else { return false }
+                return cmd.contains("hook.sh") && (cmd.contains("ClaudeTOC") || cmd.contains("TOC for Claude Code") || cmd.contains("claude-toc"))
             }
         }
 
-        if !found {
-            // Append new entry
-            let hookEntry: [String: Any] = [
-                "hooks": [[
-                    "type": "command",
-                    "command": hookPath,
-                    "async": true
-                ]]
-            ]
-            stopHooks.append(hookEntry)
-        }
+        // Add fresh entry with correct path
+        stopHooks.append([
+            "hooks": [[
+                "type": "command",
+                "command": hookPath,
+                "async": true
+            ]]
+        ])
 
         hooks["Stop"] = stopHooks
         settings["hooks"] = hooks
