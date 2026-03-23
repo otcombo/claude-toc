@@ -76,6 +76,17 @@ if let path = transcriptPath {
     exit(0)
 }
 
+// No transcript path — user launched the app directly.
+// If another instance is already running, activate it and exit.
+let bundleId = Bundle.main.bundleIdentifier ?? "com.otcombo.claudetoc"
+let myPid = ProcessInfo.processInfo.processIdentifier
+let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
+    .filter { $0.processIdentifier != myPid }
+if let existing = others.first {
+    existing.activate()
+    exit(0)
+}
+
 // We are the main instance
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
