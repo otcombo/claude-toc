@@ -219,8 +219,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         stopHooks.append([
             "hooks": [[
                 "type": "command",
-                "command": hookPath,
-                "async": true
+                "command": "'\(hookPath)'"
             ]]
         ])
 
