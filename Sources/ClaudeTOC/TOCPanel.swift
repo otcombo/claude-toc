@@ -185,7 +185,9 @@ class TOCSessionManager {
         }
 
         // Close existing panel for this session
+        sessions[sessionId]?.panel?.orderOut(nil)
         sessions[sessionId]?.panel?.close()
+        sessions[sessionId]?.panel = nil
 
         // Parse transcript — retry briefly if the latest entry isn't an assistant message yet
         // (the Stop hook can fire before the transcript file is fully flushed)
@@ -243,7 +245,9 @@ class TOCSessionManager {
         axWindow: AXUIElement?, windowID: CGWindowID?
     ) {
         // Close existing panel for this session
+        sessions[sessionId]?.panel?.orderOut(nil)
         sessions[sessionId]?.panel?.close()
+        sessions[sessionId]?.panel = nil
 
         let session = TOCSession(
             id: sessionId, transcriptPath: transcriptPath, projectName: projectName,
