@@ -16,19 +16,22 @@ struct TOCResult: Sendable {
     let responsePreview: String?      // first ~60 chars of assistant response
 }
 
+struct TranscriptParseSnapshot: Sendable {
+    let tocResult: TOCResult?
+    let endsWithAssistant: Bool
+}
+
 enum TOCParser {
-    static func parse(transcriptPath: String, terminalColumns: Int = 80) -> TOCResult? {
+    static func parseSnapshot(transcriptPath: String, terminalColumns: Int = 80) -> TranscriptParseSnapshot? {
         guard let data = FileManager.default.contents(atPath: transcriptPath),
               let content = String(data: data, encoding: .utf8) else {
             return nil
         }
 
-        // Read from tail: only parse the last few JSONL entries to find
-        // the latest user query + assistant response (avoids scanning the entire file)
         let lines = content.components(separatedBy: "\n")
-
         var lastUserQuery: String?
-        var latestAssistantText: String?
+        var assistantTexts: [String] = []
+        var latestEntryType: String?
 
         for i in stride(from: lines.count - 1, through: 0, by: -1) {
             let line = lines[i]
@@ -40,17 +43,30 @@ enum TOCParser {
                 continue
             }
 
-            if type == "assistant" && latestAssistantText == nil {
-                latestAssistantText = Self.extractText(from: message)
-            } else if type == "user" && lastUserQuery == nil {
-                lastUserQuery = Self.extractText(from: message)
+            if latestEntryType == nil {
+                latestEntryType = type
             }
 
-            if lastUserQuery != nil && latestAssistantText != nil { break }
+            if type == "assistant" && lastUserQuery == nil {
+                // Still in the current turn — collect all text blocks
+                if let text = Self.extractText(from: message) {
+                    assistantTexts.insert(text, at: 0)
+                }
+            } else if type == "user" {
+                lastUserQuery = Self.extractText(from: message)
+                break
+            }
         }
 
-        let tocText = latestAssistantText ?? ""
-        guard !tocText.isEmpty else { return nil }
+        let endsWithAssistant = latestEntryType == "assistant"
+        guard endsWithAssistant else {
+            return TranscriptParseSnapshot(tocResult: nil, endsWithAssistant: false)
+        }
+
+        let tocText = assistantTexts.isEmpty ? "" : assistantTexts.joined(separator: "\n")
+        guard !tocText.isEmpty else {
+            return TranscriptParseSnapshot(tocResult: nil, endsWithAssistant: true)
+        }
 
         // Extract markdown headings from the heading-bearing assistant text
         let textLines = tocText.components(separatedBy: "\n")
@@ -103,7 +119,7 @@ enum TOCParser {
         }
         let responsePreview: String? = previewCollected.isEmpty ? nil : previewCollected.joined(separator: "\n")
 
-        return TOCResult(
+        let tocResult = TOCResult(
             headings: headings,
             totalLines: textLines.count,
             estimatedTerminalLines: currentTerminalLine,
@@ -111,6 +127,11 @@ enum TOCParser {
             lastUserQuery: lastUserQuery,
             responsePreview: responsePreview
         )
+        return TranscriptParseSnapshot(tocResult: tocResult, endsWithAssistant: true)
+    }
+
+    static func parse(transcriptPath: String, terminalColumns: Int = 80) -> TOCResult? {
+        parseSnapshot(transcriptPath: transcriptPath, terminalColumns: terminalColumns)?.tocResult
     }
 
     /// Extract text content from a transcript message object
