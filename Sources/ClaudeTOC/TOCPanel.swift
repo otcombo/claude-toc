@@ -89,6 +89,7 @@ class TOCSession {
     var axWindow: AXUIElement?       // the specific terminal window at hook time
     var windowID: CGWindowID?        // stable window identifier for matching
     var panel: TOCPanel?
+    var isPanelDismissed = false
 
     init(id: String, transcriptPath: String, projectName: String?, tocResult: TOCResult?,
          terminalType: TerminalType, terminalApp: NSRunningApplication?,
@@ -123,6 +124,8 @@ class TOCSession {
 @MainActor
 class TOCSessionManager {
     private var sessions: [String: TOCSession] = [:]
+    private var pendingSessionLoads: [String: Task<Void, Never>] = [:]
+    private var sessionLoadTokens: [String: UUID] = [:]
     var onSessionsChanged: (() -> Void)?
     var windowObserver: WindowObserver?
     private var notificationAuthorized = false
@@ -189,53 +192,68 @@ class TOCSessionManager {
         sessions[sessionId]?.panel?.close()
         sessions[sessionId]?.panel = nil
 
-        // Parse transcript — retry briefly if the latest entry isn't an assistant message yet
-        // (the Stop hook can fire before the transcript file is fully flushed)
-        let tocResult = TOCParser.parse(transcriptPath: transcriptPath, terminalColumns: termColumns)
-        if tocResult == nil || !Self.transcriptEndsWithAssistant(path: transcriptPath) {
-            log("SessionManager: transcript not ready, scheduling retry")
-            let capturedTerminalApp = terminalApp
-            let capturedTerminalType = terminalType
-            let capturedAxWindow = axWindow
-            let capturedWindowID = windowID
-            // Retry after a short delay
-            Task { @MainActor in
-                for attempt in 1...5 {
+        pendingSessionLoads[sessionId]?.cancel()
+        let loadToken = UUID()
+        sessionLoadTokens[sessionId] = loadToken
+
+        let loadTask = Task { [weak self] in
+            guard let self = self else { return }
+            defer {
+                Task { @MainActor [weak self] in
+                    guard let self = self,
+                          self.sessionLoadTokens[sessionId] == loadToken else { return }
+                    self.pendingSessionLoads.removeValue(forKey: sessionId)
+                    self.sessionLoadTokens.removeValue(forKey: sessionId)
+                }
+            }
+
+            var latestSnapshot: TranscriptParseSnapshot?
+            for attempt in 0...5 {
+                if Task.isCancelled { return }
+
+                if attempt > 0 {
                     try? await Task.sleep(for: .milliseconds(500))
-                    let retryResult = TOCParser.parse(transcriptPath: transcriptPath, terminalColumns: termColumns)
-                    let ready = Self.transcriptEndsWithAssistant(path: transcriptPath)
-                    log("SessionManager: retry \(attempt), headings=\(retryResult?.headings.count ?? 0), ready=\(ready)")
-                    if ready, let result = retryResult {
+                }
+
+                let snapshot = await self.loadSnapshot(
+                    transcriptPath: transcriptPath,
+                    terminalColumns: termColumns
+                )
+                latestSnapshot = snapshot
+
+                let ready = snapshot?.endsWithAssistant == true
+                let headingCount = snapshot?.tocResult?.headings.count ?? 0
+                log("SessionManager: retry \(attempt), headings=\(headingCount), ready=\(ready)")
+
+                if ready {
+                    await MainActor.run {
+                        guard self.sessionLoadTokens[sessionId] == loadToken else { return }
                         self.finalizeSession(
                             sessionId: sessionId, transcriptPath: transcriptPath,
-                            projectName: projectName, tocResult: result,
-                            terminalType: capturedTerminalType, terminalApp: capturedTerminalApp,
-                            terminalRows: terminalRows, axWindow: capturedAxWindow, windowID: capturedWindowID
+                            projectName: projectName, tocResult: snapshot?.tocResult,
+                            terminalType: terminalType, terminalApp: terminalApp,
+                            terminalRows: terminalRows, axWindow: axWindow, windowID: windowID
                         )
-                        return
                     }
+                    return
                 }
-                // Timeout — use whatever we have
-                log("SessionManager: retry timeout, using available data")
-                let finalResult = TOCParser.parse(transcriptPath: transcriptPath, terminalColumns: termColumns)
+            }
+
+            if Task.isCancelled { return }
+
+            log("SessionManager: retry timeout, using available data")
+            await MainActor.run {
+                guard self.sessionLoadTokens[sessionId] == loadToken else { return }
                 self.finalizeSession(
                     sessionId: sessionId, transcriptPath: transcriptPath,
-                    projectName: projectName, tocResult: finalResult,
-                    terminalType: capturedTerminalType, terminalApp: capturedTerminalApp,
-                    terminalRows: terminalRows, axWindow: capturedAxWindow, windowID: capturedWindowID
+                    projectName: projectName, tocResult: latestSnapshot?.tocResult,
+                    terminalType: terminalType, terminalApp: terminalApp,
+                    terminalRows: terminalRows, axWindow: axWindow, windowID: windowID
                 )
             }
-            return
         }
 
-        log("SessionManager: headings=\(tocResult?.headings.count ?? 0), query: \(tocResult?.lastUserQuery?.prefix(40) ?? "nil")")
-
-        finalizeSession(
-            sessionId: sessionId, transcriptPath: transcriptPath,
-            projectName: projectName, tocResult: tocResult,
-            terminalType: terminalType, terminalApp: terminalApp,
-            terminalRows: terminalRows, axWindow: axWindow, windowID: windowID
-        )
+        pendingSessionLoads[sessionId] = loadTask
     }
 
     private func finalizeSession(
@@ -255,17 +273,17 @@ class TOCSessionManager {
             terminalRows: terminalRows, axWindow: axWindow, windowID: windowID
         )
 
-        // Show TOC panel only if there are headings
-        if let toc = tocResult, !toc.headings.isEmpty {
-            showPanel(for: session)
-        }
-
         sessions[sessionId] = session
         log("SessionManager: session \(sessionId) finalized, windowID=\(windowID.map(String.init) ?? "nil"), headings=\(tocResult?.headings.count ?? 0), total sessions: \(sessions.count)")
 
         // Only send notification if the terminal is not in the foreground
-        let terminalIsActive = session.terminalApp?.isActive == true
-        if !terminalIsActive {
+        let terminalIsActive = NSWorkspace.shared.frontmostApplication?.processIdentifier == session.terminalApp?.processIdentifier
+        let hasHeadings = tocResult?.headings.isEmpty == false
+
+        if hasHeadings && terminalIsActive {
+            showPanel(for: session)
+            updateVisiblePanels()
+        } else if !terminalIsActive {
             sendNotification(for: session)
         } else {
             log("SessionManager: skipping notification — terminal is active")
@@ -274,16 +292,10 @@ class TOCSessionManager {
         onSessionsChanged?()
     }
 
-    /// Check if the last entry in the transcript JSONL is an assistant message
-    private static func transcriptEndsWithAssistant(path: String) -> Bool {
-        guard let data = FileManager.default.contents(atPath: path),
-              let content = String(data: data, encoding: .utf8) else { return false }
-        let lines = content.components(separatedBy: "\n").filter { !$0.isEmpty }
-        guard let lastLine = lines.last,
-              let jsonData = lastLine.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-              let type = json["type"] as? String else { return false }
-        return type == "assistant"
+    private func loadSnapshot(transcriptPath: String, terminalColumns: Int) async -> TranscriptParseSnapshot? {
+        await Task.detached(priority: .userInitiated) {
+            TOCParser.parseSnapshot(transcriptPath: transcriptPath, terminalColumns: terminalColumns)
+        }.value
     }
 
     /// Find an AXUIElement window by its CGWindowID
@@ -303,6 +315,11 @@ class TOCSessionManager {
     }
 
     func closeAll() {
+        for task in pendingSessionLoads.values {
+            task.cancel()
+        }
+        pendingSessionLoads.removeAll()
+        sessionLoadTokens.removeAll()
         for session in sessions.values {
             session.panel?.close()
             session.panel = nil
@@ -314,6 +331,7 @@ class TOCSessionManager {
     /// Hide the TOC panel but keep the session alive so it can be re-shown
     func hideSession(id: String) {
         guard let session = sessions[id] else { return }
+        session.isPanelDismissed = true
         session.panel?.orderOut(nil)
         session.panel?.close()
         session.panel = nil
@@ -323,6 +341,10 @@ class TOCSessionManager {
 
     /// Remove the session entirely (from menu bar "Remove" action)
     func removeSession(id: String) {
+        pendingSessionLoads[id]?.cancel()
+        pendingSessionLoads.removeValue(forKey: id)
+        sessionLoadTokens.removeValue(forKey: id)
+
         let removedSession = sessions[id]
         removedSession?.panel?.close()
         sessions.removeValue(forKey: id)
@@ -341,6 +363,7 @@ class TOCSessionManager {
     func reshowSession(id: String) {
         guard let session = sessions[id], session.panel == nil,
               let tocResult = session.tocResult, !tocResult.headings.isEmpty else { return }
+        session.isPanelDismissed = false
         showPanel(for: session)
         log("SessionManager: re-shown session \(id)")
         onSessionsChanged?()
@@ -384,8 +407,6 @@ class TOCSessionManager {
         log("updateVisiblePanels: activeApp=\(activeApp.bundleIdentifier ?? "?") pid=\(activeAppPid), focusedWID=\(focusedWID.map(String.init) ?? "nil"), focusedAX=\(focusedAXWindow != nil)")
 
         for session in sessions.values {
-            guard session.panel != nil else { continue }
-
             if session.terminalApp?.processIdentifier == activeAppPid {
                 // This session belongs to the active app — match by CGWindowID
                 log("  session \(session.id.prefix(8)): sessionWID=\(session.windowID.map(String.init) ?? "nil"), axWindow=\(session.axWindow != nil)")
@@ -394,7 +415,11 @@ class TOCSessionManager {
                         log("  → MATCH, showing")
                         // Update axWindow reference in case it went stale
                         session.axWindow = focusedAXWindow
-                        repositionAndShow(session)
+                        if session.tocResult?.headings.isEmpty == false, !session.isPanelDismissed {
+                            repositionAndShow(session)
+                        } else {
+                            session.panel?.orderOut(nil)
+                        }
                     } else {
                         log("  → MISMATCH (\(sessionWID) != \(currentWID)), hiding")
                         session.panel?.orderOut(nil)
@@ -402,7 +427,11 @@ class TOCSessionManager {
                 } else if focusedWID == nil {
                     // Can't determine focused window — show all as fallback
                     log("  → focusedWID nil, fallback show")
-                    repositionAndShow(session)
+                    if session.tocResult?.headings.isEmpty == false, !session.isPanelDismissed {
+                        repositionAndShow(session)
+                    } else {
+                        session.panel?.orderOut(nil)
+                    }
                 } else {
                     // Session has no windowID but we know the focused window — hide it
                     log("  → session has no WID, hiding")
@@ -438,7 +467,7 @@ class TOCSessionManager {
     }
 
     private func repositionAndShow(_ session: TOCSession, animate: Bool = false) {
-        guard let panel = session.panel else { return }
+        guard let panel = ensurePanel(for: session) else { return }
         let panelW = panel.frame.width
         let panelH = panel.frame.height
 
@@ -447,10 +476,7 @@ class TOCSessionManager {
            let windowFrame = axWindowFrame(axWindow) {
             origin = panelOriginFromWindowFrame(windowFrame, panelWidth: panelW, panelHeight: panelH)
         } else {
-            origin = findTerminalTopRight(
-                terminalApp: session.terminalApp,
-                panelWidth: panelW, panelHeight: panelH
-            )
+            origin = findTerminalTopRight(session: session, panelWidth: panelW, panelHeight: panelH)
         }
 
         if panel.isVisible {
@@ -473,18 +499,22 @@ class TOCSessionManager {
         var posRef: CFTypeRef?
         var sizeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posRef) == .success,
-              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success else {
+              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let posValue = axValue(from: posRef, type: .cgPoint),
+              let sizeValue = axValue(from: sizeRef, type: .cgSize) else {
             return nil
         }
         var pos = CGPoint.zero
         var size = CGSize.zero
-        AXValueGetValue(posRef as! AXValue, .cgPoint, &pos)
-        AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
+        guard AXValueGetValue(posValue, .cgPoint, &pos),
+              AXValueGetValue(sizeValue, .cgSize, &size) else {
+            return nil
+        }
         return CGRect(origin: pos, size: size)
     }
 
     private func panelOriginFromWindowFrame(_ windowFrame: CGRect, panelWidth: CGFloat, panelHeight: CGFloat) -> NSPoint {
-        let primaryHeight = NSScreen.screens[0].frame.height
+        let primaryHeight = (NSScreen.screens.first ?? NSScreen.main)?.frame.height ?? 0
         let titleBarHeight: CGFloat = 28
         let termRightNS = windowFrame.maxX
         let termTopNS = primaryHeight - windowFrame.minY
@@ -508,8 +538,13 @@ class TOCSessionManager {
 
     // MARK: - Panel creation
 
-    private func showPanel(for session: TOCSession) {
-        guard let tocResult = session.tocResult else { return }
+    @discardableResult
+    private func ensurePanel(for session: TOCSession) -> TOCPanel? {
+        if let panel = session.panel {
+            return panel
+        }
+
+        guard let tocResult = session.tocResult, !tocResult.headings.isEmpty else { return nil }
         let sessionId = session.id
 
         let hostingView = TOCHostingView(rootView: TOCView(
@@ -528,14 +563,18 @@ class TOCSessionManager {
         let panelWidth = fittingSize.width
         let panelHeight = fittingSize.height
 
-        let panelOrigin = findTerminalTopRight(
-            terminalApp: session.terminalApp, panelWidth: panelWidth, panelHeight: panelHeight)
+        let panelOrigin = findTerminalTopRight(session: session, panelWidth: panelWidth, panelHeight: panelHeight)
         let panelRect = NSRect(x: panelOrigin.x, y: panelOrigin.y, width: panelWidth, height: panelHeight)
 
         let newPanel = TOCPanel(contentRect: panelRect)
         newPanel.contentView = hostingView
-        newPanel.orderFrontRegardless()
         session.panel = newPanel
+        return newPanel
+    }
+
+    private func showPanel(for session: TOCSession) {
+        guard ensurePanel(for: session) != nil else { return }
+        repositionAndShow(session)
     }
 
     private func handleHeadingClick(_ heading: TOCHeading, sessionId: String) {
@@ -609,12 +648,27 @@ class TOCSessionManager {
 
     // MARK: - Positioning
 
-    private func findTerminalTopRight(terminalApp: NSRunningApplication?, panelWidth: CGFloat, panelHeight: CGFloat) -> NSPoint {
-        guard let termApp = terminalApp else {
+    private func findTerminalTopRight(session: TOCSession, panelWidth: CGFloat, panelHeight: CGFloat) -> NSPoint {
+        guard let termApp = session.terminalApp else {
             return fallbackPosition(panelWidth: panelWidth, panelHeight: panelHeight)
         }
 
-        let pid = termApp.processIdentifier
+        if let windowFrame = cgWindowFrame(windowID: session.windowID, pid: termApp.processIdentifier) {
+            return panelOriginFromWindowFrame(windowFrame, panelWidth: panelWidth, panelHeight: panelHeight)
+        }
+
+        return fallbackPosition(panelWidth: panelWidth, panelHeight: panelHeight)
+    }
+
+    private func fallbackPosition(panelWidth: CGFloat, panelHeight: CGFloat) -> NSPoint {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+            return NSPoint(x: 20, y: 20)
+        }
+        let vf = screen.visibleFrame
+        return NSPoint(x: vf.maxX - panelWidth - 20, y: vf.maxY - panelHeight - 20)
+    }
+
+    private func cgWindowFrame(windowID: CGWindowID?, pid: pid_t) -> CGRect? {
         let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
 
         for windowInfo in windowList {
@@ -627,35 +681,16 @@ class TOCSessionManager {
                 continue
             }
 
-            let primaryHeight = NSScreen.screens[0].frame.height
-            let titleBarHeight: CGFloat = 28
-            let termRightNS = cgX + cgW
-            let termTopNS = primaryHeight - cgY
-
-            var panelX = termRightNS - panelWidth - 16
-            var panelY = termTopNS - panelHeight - titleBarHeight - 16
-
-            let termCenterCG = CGPoint(x: cgX + cgW / 2, y: cgY + cgH / 2)
-            for screen in NSScreen.screens {
-                let screenCGY = primaryHeight - screen.frame.maxY
-                let screenCGRect = CGRect(x: screen.frame.minX, y: screenCGY, width: screen.frame.width, height: screen.frame.height)
-                if screenCGRect.contains(termCenterCG) {
-                    let vf = screen.visibleFrame
-                    panelX = min(max(panelX, vf.minX + 8), vf.maxX - panelWidth - 8)
-                    panelY = min(max(panelY, vf.minY + 8), vf.maxY - panelHeight - 8)
-                    break
-                }
+            if let targetWindowID = windowID,
+               let windowNumber = windowInfo[kCGWindowNumber as String] as? UInt32,
+               CGWindowID(windowNumber) != targetWindowID {
+                continue
             }
-            return NSPoint(x: panelX, y: panelY)
+
+            return CGRect(x: cgX, y: cgY, width: cgW, height: cgH)
         }
 
-        return fallbackPosition(panelWidth: panelWidth, panelHeight: panelHeight)
-    }
-
-    private func fallbackPosition(panelWidth: CGFloat, panelHeight: CGFloat) -> NSPoint {
-        let screen = NSScreen.main ?? NSScreen.screens[0]
-        let vf = screen.visibleFrame
-        return NSPoint(x: vf.maxX - panelWidth - 20, y: vf.maxY - panelHeight - 20)
+        return nil
     }
 
     // MARK: - Helpers
@@ -668,6 +703,12 @@ class TOCSessionManager {
         guard let last = segments.last, !last.isEmpty else { return nil }
         return last
     }
+}
+
+private func axValue(from ref: CFTypeRef?, type: AXValueType) -> AXValue? {
+    guard let ref, CFGetTypeID(ref) == AXValueGetTypeID() else { return nil }
+    let value = unsafeDowncast(ref, to: AXValue.self)
+    return AXValueGetType(value) == type ? value : nil
 }
 
 /// Handles notification click → activate the correct terminal window and scroll to response
@@ -684,6 +725,18 @@ class NotificationClickHandler: NSObject, UNUserNotificationCenterDelegate, @unc
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let userInfo = response.notification.request.content.userInfo
+
+        // Handle update notification
+        if userInfo["action"] as? String == "showUpdateWindow" {
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    Updater.shared.showUpdateWindow()
+                }
+            }
+            completionHandler()
+            return
+        }
+
         let sessionId = userInfo["sessionId"] as? String
 
         // Activate terminal window
@@ -736,4 +789,3 @@ class NotificationClickHandler: NSObject, UNUserNotificationCenterDelegate, @unc
         completionHandler([.banner, .sound])
     }
 }
-

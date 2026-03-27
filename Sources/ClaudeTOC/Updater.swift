@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import SwiftUI
+@preconcurrency import UserNotifications
 
 /// Self-updater via GitHub Releases.
 /// Checks `otcombo/claude-toc` for a newer tag, downloads the zip asset,
@@ -115,11 +116,20 @@ class Updater {
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.timeoutInterval = 15
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self = self else { return }
                     self.isChecking = false
+
+                    if let httpResponse = response as? HTTPURLResponse,
+                       httpResponse.statusCode != 200 {
+                        log("Updater: latest release check returned HTTP \(httpResponse.statusCode)")
+                        self.checkFailed = true
+                        self.onStatusChanged?()
+                        self.syncViewState()
+                        return
+                    }
 
                     guard let data = data,
                           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -135,6 +145,10 @@ class Updater {
                     self.latestVersion = remote
                     self.checkFailed = false
                     log("Updater: current=\(self.currentVersion) latest=\(remote)")
+
+                    if silent && self.updateAvailable {
+                        self.sendUpdateNotification(version: remote)
+                    }
 
                     self.onStatusChanged?()
                     self.syncViewState()
@@ -184,7 +198,24 @@ class Updater {
                         return
                     }
 
-                    self.installAndRelaunch(zipURL: tempURL)
+                    let currentBundle = Bundle.main.bundlePath
+                    let currentPID = ProcessInfo.processInfo.processIdentifier
+                    let currentIdentifier = Bundle.main.bundleIdentifier ?? "com.otcombo.claudetoc"
+
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        let result = Self.prepareInstall(
+                            zipURL: tempURL,
+                            currentAppBundlePath: currentBundle,
+                            currentBundleIdentifier: currentIdentifier,
+                            currentPID: currentPID
+                        )
+
+                        DispatchQueue.main.async {
+                            MainActor.assumeIsolated {
+                                self.finishUpdatePreparation(result: result)
+                            }
+                        }
+                    }
                 }
             }
         }.resume()
@@ -192,82 +223,47 @@ class Updater {
 
     // MARK: - Install
 
-    private func installAndRelaunch(zipURL: URL) {
-        guard let appBundle = Bundle.main.bundlePath as String?,
-              appBundle.hasSuffix(".app") else {
-            log("Updater: not running from .app bundle, cannot update")
+    private func finishUpdatePreparation(result: UpdatePreparationResult) {
+        switch result {
+        case .failure(let message):
+            log(message)
             isUpdating = false
             onStatusChanged?()
             syncViewState()
-            return
+        case .ready(let scriptPath):
+            let launcher = Process()
+            launcher.executableURL = URL(fileURLWithPath: "/bin/bash")
+            launcher.arguments = [scriptPath.path]
+            launcher.standardOutput = FileHandle.nullDevice
+            launcher.standardError = FileHandle.nullDevice
+
+            do {
+                try launcher.run()
+            } catch {
+                log("Updater: failed to launch installer: \(error)")
+                isUpdating = false
+                onStatusChanged?()
+                syncViewState()
+                return
+            }
+
+            log("Updater: launched update script, quitting app")
+            NSApplication.shared.terminate(nil)
         }
+    }
 
-        let appURL = URL(fileURLWithPath: appBundle)
-        let parentDir = appURL.deletingLastPathComponent()
-        let appName = appURL.lastPathComponent
+    // MARK: - Update notification
 
-        let extractDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("claude-toc-update-\(UUID().uuidString)")
+    private func sendUpdateNotification(version: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "有新版本可用"
+        content.body = "v\(currentVersion) → v\(version)"
+        content.userInfo = ["action": "showUpdateWindow"]
 
-        let unzip = Process()
-        unzip.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-        unzip.arguments = ["-o", zipURL.path, "-d", extractDir.path]
-        unzip.standardOutput = FileHandle.nullDevice
-        unzip.standardError = FileHandle.nullDevice
-
-        do {
-            try unzip.run()
-            unzip.waitUntilExit()
-        } catch {
-            log("Updater: unzip failed: \(error)")
-            isUpdating = false
-            onStatusChanged?()
-            syncViewState()
-            return
+        let request = UNNotificationRequest(identifier: "update-available", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error { log("Updater: notification error: \(error)") }
         }
-
-        guard unzip.terminationStatus == 0 else {
-            log("Updater: unzip exit code \(unzip.terminationStatus)")
-            isUpdating = false
-            onStatusChanged?()
-            syncViewState()
-            return
-        }
-
-        let fm = FileManager.default
-        guard let contents = try? fm.contentsOfDirectory(at: extractDir, includingPropertiesForKeys: nil),
-              let newApp = contents.first(where: { $0.pathExtension == "app" }) else {
-            log("Updater: no .app found in zip")
-            isUpdating = false
-            onStatusChanged?()
-            syncViewState()
-            return
-        }
-
-        let destApp = parentDir.appendingPathComponent(appName)
-        let script = """
-        #!/bin/bash
-        while kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do
-            sleep 0.2
-        done
-        rm -rf "\(destApp.path)"
-        mv "\(newApp.path)" "\(destApp.path)"
-        rm -rf "\(extractDir.path)"
-        open "\(destApp.path)"
-        """
-
-        let scriptPath = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("claude-toc-update.sh")
-        try? script.write(to: scriptPath, atomically: true, encoding: .utf8)
-        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath.path)
-
-        let launcher = Process()
-        launcher.executableURL = URL(fileURLWithPath: "/bin/bash")
-        launcher.arguments = [scriptPath.path]
-        launcher.standardOutput = FileHandle.nullDevice
-        launcher.standardError = FileHandle.nullDevice
-        try? launcher.run()
-
-        log("Updater: launched update script, quitting app")
-        NSApplication.shared.terminate(nil)
     }
 
     // MARK: - Helpers
@@ -282,5 +278,96 @@ class Updater {
             if r < l { return false }
         }
         return false
+    }
+}
+
+private enum UpdatePreparationResult {
+    case ready(scriptPath: URL)
+    case failure(String)
+}
+
+private extension Updater {
+    nonisolated static func prepareInstall(
+        zipURL: URL,
+        currentAppBundlePath: String,
+        currentBundleIdentifier: String,
+        currentPID: Int32
+    ) -> UpdatePreparationResult {
+        guard currentAppBundlePath.hasSuffix(".app") else {
+            return .failure("Updater: not running from .app bundle, cannot update")
+        }
+
+        let appURL = URL(fileURLWithPath: currentAppBundlePath)
+        let parentDir = appURL.deletingLastPathComponent()
+        let appName = appURL.lastPathComponent
+        let extractDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("claude-toc-update-\(UUID().uuidString)")
+
+        let unzip = Process()
+        unzip.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        unzip.arguments = ["-o", zipURL.path, "-d", extractDir.path]
+        unzip.standardOutput = FileHandle.nullDevice
+        unzip.standardError = FileHandle.nullDevice
+
+        do {
+            try unzip.run()
+            unzip.waitUntilExit()
+        } catch {
+            return .failure("Updater: unzip failed: \(error)")
+        }
+
+        guard unzip.terminationStatus == 0 else {
+            return .failure("Updater: unzip exit code \(unzip.terminationStatus)")
+        }
+
+        let fm = FileManager.default
+        guard let contents = try? fm.contentsOfDirectory(at: extractDir, includingPropertiesForKeys: nil),
+              let newApp = contents.first(where: { $0.pathExtension == "app" }) else {
+            return .failure("Updater: no .app found in zip")
+        }
+
+        guard verifyCodeSignature(appURL: newApp, expectedBundleIdentifier: currentBundleIdentifier) else {
+            return .failure("Updater: downloaded app failed signature verification")
+        }
+
+        let destApp = parentDir.appendingPathComponent(appName)
+        let script = """
+        #!/bin/bash
+        while kill -0 \(currentPID) 2>/dev/null; do
+            sleep 0.2
+        done
+        rm -rf "\(destApp.path)"
+        mv "\(newApp.path)" "\(destApp.path)"
+        rm -rf "\(extractDir.path)"
+        open "\(destApp.path)"
+        """
+
+        let scriptPath = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("claude-toc-update-\(UUID().uuidString).sh")
+        do {
+            try script.write(to: scriptPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath.path)
+            return .ready(scriptPath: scriptPath)
+        } catch {
+            return .failure("Updater: failed to prepare installer script: \(error)")
+        }
+    }
+
+    nonisolated static func verifyCodeSignature(appURL: URL, expectedBundleIdentifier: String) -> Bool {
+        let verify = Process()
+        verify.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        verify.arguments = ["--verify", "--deep", "--strict", appURL.path]
+        verify.standardOutput = FileHandle.nullDevice
+        verify.standardError = FileHandle.nullDevice
+
+        do {
+            try verify.run()
+            verify.waitUntilExit()
+        } catch {
+            return false
+        }
+
+        guard verify.terminationStatus == 0 else { return false }
+
+        let bundle = Bundle(url: appURL)
+        return bundle?.bundleIdentifier == expectedBundleIdentifier
     }
 }
