@@ -11,6 +11,7 @@ class Updater {
     static let shared = Updater()
 
     private let repo = "otcombo/claude-toc"
+    /// MUST be .zip — auto-update uses unzip to extract. DMG is for manual download only.
     private let assetName = "TOC.for.Claude.Code.app.zip"
     private var checkTimer: Timer?
     private(set) var latestVersion: String?

@@ -4,14 +4,15 @@ set -e
 
 cd "$(dirname "$0")"
 
-echo "Building..."
-swift build
+echo "Building (release)..."
+swift build -c release
 
 BINARY_NAME="ClaudeTOC"
 DISPLAY_NAME="TOC for Claude Code"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_DIR="${SCRIPT_DIR}/build/${DISPLAY_NAME}.app"
-BINARY=".build/arm64-apple-macosx/debug/${BINARY_NAME}"
+BIN_PATH=$(swift build -c release --show-bin-path)
+BINARY="${BIN_PATH}/${BINARY_NAME}"
 
 echo "Packaging ${APP_DIR}..."
 rm -rf "$APP_DIR"
@@ -60,18 +61,65 @@ fi
 
 echo "Done: ${APP_DIR}"
 
-# Create DMG
+# Create DMG with styled installer window
 DMG_DIR="${SCRIPT_DIR}/build"
 DMG_PATH="${DMG_DIR}/${DISPLAY_NAME}.dmg"
-rm -f "$DMG_PATH"
+DMG_RW="${DMG_DIR}/${DISPLAY_NAME}_rw.dmg"
+DMG_VOLUME="/Volumes/${DISPLAY_NAME}"
+rm -f "$DMG_PATH" "$DMG_RW"
 
-# Create a temporary folder with app + Applications symlink for drag-install
+# Prepare staging folder with app + Applications symlink
 DMG_STAGING=$(mktemp -d)
+trap 'rm -rf "$DMG_STAGING" "$DMG_RW" 2>/dev/null' EXIT
 cp -R "$APP_DIR" "$DMG_STAGING/"
 ln -s /Applications "$DMG_STAGING/Applications"
 
-hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$DMG_STAGING" -ov -format UDZO "$DMG_PATH" 2>&1
+# Step 1: Create read-write DMG
+echo "Creating DMG..."
+hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$DMG_STAGING" -ov -format UDRW "$DMG_RW" 2>&1
 rm -rf "$DMG_STAGING"
+
+# Step 2: Mount read-write DMG
+DEVICE=$(hdiutil attach -readwrite -noverify -noautoopen "$DMG_RW" | grep "Apple_HFS\|Apple_APFS" | head -1 | awk '{print $1}')
+if [ -z "$DEVICE" ]; then
+    echo "ERROR: Failed to mount DMG"
+    exit 1
+fi
+
+# Wait for Finder to recognize the volume
+for i in $(seq 1 10); do
+    [ -d "$DMG_VOLUME" ] && break
+    sleep 0.5
+done
+
+# Step 3: Apply Finder window layout via AppleScript
+echo "Styling DMG window..."
+osascript <<APPLESCRIPT
+tell application "Finder"
+    tell disk "${DISPLAY_NAME}"
+        open
+        set current view of container window to icon view
+        set toolbar visible of container window to false
+        set statusbar visible of container window to false
+        set bounds of container window to {100, 100, 700, 500}
+        set opts to icon view options of container window
+        set icon size of opts to 128
+        set arrangement of opts to not arranged
+        set position of item "${DISPLAY_NAME}.app" of container window to {160, 180}
+        set position of item "Applications" of container window to {440, 180}
+        close
+    end tell
+end tell
+APPLESCRIPT
+
+# Step 4: Wait for .DS_Store to flush, then detach
+sync
+sleep 2
+hdiutil detach "$DEVICE" 2>/dev/null || hdiutil detach "$DEVICE" -force
+
+# Step 5: Convert to compressed read-only DMG
+hdiutil convert "$DMG_RW" -format UDZO -o "$DMG_PATH" 2>&1
+rm -f "$DMG_RW"
 
 # Create ZIP for auto-updater
 ZIP_PATH="${DMG_DIR}/TOC.for.Claude.Code.app.zip"
