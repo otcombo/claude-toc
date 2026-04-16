@@ -65,12 +65,17 @@ echo "Done: ${APP_DIR}"
 DMG_DIR="${SCRIPT_DIR}/build"
 DMG_PATH="${DMG_DIR}/${DISPLAY_NAME}.dmg"
 DMG_RW="${DMG_DIR}/${DISPLAY_NAME}_rw.dmg"
-DMG_VOLUME="/Volumes/${DISPLAY_NAME}"
+DEVICE=""
 rm -f "$DMG_PATH" "$DMG_RW"
+
+cleanup_dmg() {
+    [ -n "$DEVICE" ] && hdiutil detach "$DEVICE" -force 2>/dev/null
+    rm -rf "$DMG_STAGING" "$DMG_RW" 2>/dev/null
+}
+trap cleanup_dmg EXIT
 
 # Prepare staging folder with app + Applications symlink
 DMG_STAGING=$(mktemp -d)
-trap 'rm -rf "$DMG_STAGING" "$DMG_RW" 2>/dev/null' EXIT
 cp -R "$APP_DIR" "$DMG_STAGING/"
 ln -s /Applications "$DMG_STAGING/Applications"
 
@@ -79,12 +84,18 @@ echo "Creating DMG..."
 hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$DMG_STAGING" -ov -format UDRW "$DMG_RW" 2>&1
 rm -rf "$DMG_STAGING"
 
-# Step 2: Mount read-write DMG
-DEVICE=$(hdiutil attach -readwrite -noverify -noautoopen "$DMG_RW" | grep "Apple_HFS\|Apple_APFS" | head -1 | awk '{print $1}')
-if [ -z "$DEVICE" ]; then
+# Step 2: Mount read-write DMG and capture actual mount point
+ATTACH_OUTPUT=$(hdiutil attach -readwrite -noverify -noautoopen "$DMG_RW")
+# The mount point line contains /Volumes/; extract device and path from it
+MOUNT_LINE=$(echo "$ATTACH_OUTPUT" | grep "/Volumes/")
+DEVICE=$(echo "$MOUNT_LINE" | awk '{print $1}')
+DMG_VOLUME=$(echo "$MOUNT_LINE" | sed 's/.*\(\/Volumes\/.*\)/\1/' | sed 's/[[:space:]]*$//')
+if [ -z "$DEVICE" ] || [ -z "$DMG_VOLUME" ]; then
     echo "ERROR: Failed to mount DMG"
     exit 1
 fi
+# Actual volume name as Finder sees it (may be "Name 1" if "Name" was already mounted)
+VOLUME_NAME=$(basename "$DMG_VOLUME")
 
 # Wait for Finder to recognize the volume
 for i in $(seq 1 10); do
@@ -92,11 +103,11 @@ for i in $(seq 1 10); do
     sleep 0.5
 done
 
-# Step 3: Apply Finder window layout via AppleScript
+# Step 3: Apply Finder window layout via AppleScript (uses actual volume name, not assumed)
 echo "Styling DMG window..."
 osascript <<APPLESCRIPT
 tell application "Finder"
-    tell disk "${DISPLAY_NAME}"
+    tell disk "${VOLUME_NAME}"
         open
         set current view of container window to icon view
         set toolbar visible of container window to false
@@ -116,6 +127,7 @@ APPLESCRIPT
 sync
 sleep 2
 hdiutil detach "$DEVICE" 2>/dev/null || hdiutil detach "$DEVICE" -force
+DEVICE=""
 
 # Step 5: Convert to compressed read-only DMG
 hdiutil convert "$DMG_RW" -format UDZO -o "$DMG_PATH" 2>&1
