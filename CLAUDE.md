@@ -43,13 +43,34 @@ hook.sh (Stop hook)
 ## Build & Run
 
 ```bash
-./build.sh
-# Output: build/TOC for Claude Code.app + .dmg
+./build.sh              # Developer ID signed, fast
+./build.sh --notarize   # + Apple notarization (Gatekeeper bypass), slow
 ```
 
-- Swift 6.2, SPM, targets macOS 13+ (Platform declaration says .v26 for Liquid Glass icon support)
-- `build.sh` compiles, packages .app bundle, compiles .icon → Assets.car, codesigns, creates DMG
+- Swift 6.2, SPM, targets macOS 13+, Apple Silicon only (arm64)
+- `build.sh` compiles release, packages .app in /tmp (to avoid xattr), signs with Developer ID, creates styled DMG + ZIP
 - Requires Accessibility permission (prompted on first launch)
+
+### Release checklist
+
+```bash
+# 1. Update version in Info.plist (both CFBundleVersion and CFBundleShortVersionString)
+# 2. Build
+./build.sh
+# 3. Verify ZIP signature (critical — broken signature = auto-update fails silently)
+TMPDIR_V=$(mktemp -d) && unzip -q build/TOC.for.Claude.Code.app.zip -d "$TMPDIR_V" && \
+  codesign --verify --deep --strict "$TMPDIR_V/TOC for Claude Code.app" && echo "ZIP OK" ; rm -rf "$TMPDIR_V"
+# 4. Release
+gh release create v{version} "build/TOC for Claude Code.dmg" "build/TOC.for.Claude.Code.app.zip" --title "v{version}" --notes "..."
+# 5. Verify ZIP asset exists (auto-update depends on exact filename)
+gh release view v{version} --json assets -q '.assets[].name' | grep -q TOC.for.Claude.Code.app.zip
+```
+
+### Build pitfalls
+
+- **xattr / resource forks break codesign**: macOS `build/` directory inherits `com.apple.provenance` xattr. Files copied from it (via `cp -R` or `ditto`) carry `._` resource forks that invalidate signatures after unzip. The ZIP must be built from a clean staging dir (rsync --exclude '._*', xattr -cr, COPYFILE_DISABLE=1 ditto --norsrc). This is already handled in `build.sh` — do NOT simplify the ZIP packaging step.
+- **Sign before move**: codesign must happen in /tmp staging, not after `mv` to `build/`. The `mv` operation causes macOS to apply xattr to the destination.
+- **Auto-update asset name**: `Updater.swift` hardcodes `TOC.for.Claude.Code.app.zip` (dot-separated). The DMG uses spaces (`TOC for Claude Code.dmg`). Do not change either name — old versions depend on the exact ZIP filename.
 
 ## Hook Integration
 
