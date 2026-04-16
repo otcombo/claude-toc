@@ -1,16 +1,23 @@
 #!/bin/bash
 # Build ClaudeTOC and package as macOS .app bundle
+# Usage: ./build.sh              (sign only, fast)
+#        ./build.sh --notarize   (sign + Apple notarization, slow)
 set -e
 
 cd "$(dirname "$0")"
 
-echo "Building (release)..."
-swift build -c release
+NOTARIZE=false
+[ "$1" = "--notarize" ] && NOTARIZE=true
 
 BINARY_NAME="ClaudeTOC"
 DISPLAY_NAME="TOC for Claude Code"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_DIR="${SCRIPT_DIR}/build/${DISPLAY_NAME}.app"
+NOTARY_PROFILE="claude-toc"
+
+echo "Building (release)..."
+swift build -c release
+
 BIN_PATH=$(swift build -c release --show-bin-path)
 BINARY="${BIN_PATH}/${BINARY_NAME}"
 
@@ -37,20 +44,41 @@ fi
 cp hook.sh "${STAGE_APP}/Contents/Resources/hook.sh"
 chmod +x "${STAGE_APP}/Contents/Resources/hook.sh"
 
-# Sign the app with developer certificate (stable identity preserves TCC permissions across rebuilds)
-SIGN_HASH=$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | grep -v REVOKED | head -1 | awk '{print $2}')
-if [ -n "$SIGN_HASH" ]; then
-    codesign --force --deep --sign "$SIGN_HASH" "$STAGE_APP" 2>&1
-    echo "Signed with: $SIGN_HASH"
+# Sign in staging dir (/tmp) to avoid com.apple.provenance xattr that build/ inherits
+SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | grep -v REVOKED | head -1 | sed 's/.*"\(.*\)".*/\1/')
+if [ -n "$SIGN_IDENTITY" ]; then
+    codesign --force --options runtime --sign "$SIGN_IDENTITY" "${STAGE_APP}/Contents/MacOS/${BINARY_NAME}" 2>&1
+    codesign --force --options runtime --sign "$SIGN_IDENTITY" "$STAGE_APP" 2>&1
+    echo "Signed with: $SIGN_IDENTITY"
 else
     codesign --force --deep --sign - "$STAGE_APP" 2>/dev/null || true
-    echo "⚠  Signed ad-hoc (no developer certificate found)."
+    echo "Signed ad-hoc (no Developer ID certificate found)."
+    if $NOTARIZE; then
+        echo "ERROR: Cannot notarize without Developer ID. Skipping notarization."
+        NOTARIZE=false
+    fi
 fi
+
+# Verify signature in staging (clean of xattr)
+echo "Verifying signature..."
+codesign --verify --deep --strict "$STAGE_APP" 2>&1
 
 # Move to final location
 mkdir -p "$(dirname "$APP_DIR")"
 mv "$STAGE_APP" "$APP_DIR"
 rm -rf "$STAGING"
+
+# Notarize app (optional, slow — submits to Apple and waits)
+if $NOTARIZE; then
+    echo "Notarizing app..."
+    NOTARIZE_ZIP=$(mktemp -d)/app.zip
+    ditto -c -k --keepParent "$APP_DIR" "$NOTARIZE_ZIP"
+    xcrun notarytool submit "$NOTARIZE_ZIP" --keychain-profile "$NOTARY_PROFILE" --wait 2>&1
+    rm -f "$NOTARIZE_ZIP"
+
+    echo "Stapling ticket to app..."
+    xcrun stapler staple "$APP_DIR" 2>&1
+fi
 
 # Force Launch Services to re-index the app icon (fixes notification icon for LSUIElement apps)
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
@@ -133,7 +161,20 @@ DEVICE=""
 hdiutil convert "$DMG_RW" -format UDZO -o "$DMG_PATH" 2>&1
 rm -f "$DMG_RW"
 
-# Create ZIP for auto-updater
+# Sign and notarize DMG (optional)
+if [ -n "$SIGN_IDENTITY" ]; then
+    echo "Signing DMG..."
+    codesign --force --sign "$SIGN_IDENTITY" "$DMG_PATH" 2>&1
+fi
+if $NOTARIZE && [ -n "$SIGN_IDENTITY" ]; then
+    echo "Notarizing DMG..."
+    xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait 2>&1
+
+    echo "Stapling ticket to DMG..."
+    xcrun stapler staple "$DMG_PATH" 2>&1
+fi
+
+# Create ZIP for auto-updater (from the already-signed/notarized app)
 ZIP_PATH="${DMG_DIR}/TOC.for.Claude.Code.app.zip"
 rm -f "$ZIP_PATH"
 cd "$DMG_DIR"

@@ -47,9 +47,10 @@ enum TerminalType: String, Sendable {
     case unknown = "unknown"
 }
 
-@MainActor
 enum TerminalAdapter {
+    private static let jumpQueue = DispatchQueue(label: "ClaudeTOC.TerminalJump", qos: .userInitiated)
 
+    @MainActor
     static func detectTerminal(hookPid: Int32? = nil, bundleId providedBundleId: String? = nil) -> (TerminalType, NSRunningApplication?) {
         let knownBundleIds: [String: TerminalType] = [
             "net.kovidgoyal.kitty": .kitty,
@@ -135,6 +136,7 @@ enum TerminalAdapter {
         return 0
     }
 
+    @MainActor
     static func estimateColumns(app: NSRunningApplication?) -> Int {
         guard let app = app else { return 80 }
         let pid = app.processIdentifier
@@ -153,6 +155,7 @@ enum TerminalAdapter {
         return 80
     }
 
+    @MainActor
     static func activateTerminal(_ app: NSRunningApplication) {
         log("activateTerminal: \(app.bundleIdentifier ?? "unknown") pid=\(app.processIdentifier)")
         let result = app.activate()
@@ -171,23 +174,24 @@ enum TerminalAdapter {
         let pid = app.processIdentifier
         log("jumpToHeading: '\(heading.title)' estLine=\(heading.estimatedTerminalLine) responseLines=\(responseTerminalLines) pid=\(pid) terminal=\(terminalType.rawValue) rows=\(terminalRows.map(String.init) ?? "nil")")
 
-        activateTerminal(app)
+        jumpQueue.async {
+            DispatchQueue.main.sync {
+                activateTerminal(app)
+            }
 
-        // Tier A: try AX scroll bar (works for Terminal.app, iTerm2, Ghostty, and any terminal with AX support)
-        if jumpViaAXScrollBar(heading: heading, responseTerminalLines: responseTerminalLines, pid: pid, terminalRows: terminalRows) {
-            log("jumpToHeading: succeeded via AX scroll bar")
-            return
+            if jumpViaAXScrollBar(heading: heading, responseTerminalLines: responseTerminalLines, pid: pid, terminalRows: terminalRows) {
+                log("jumpToHeading: succeeded via AX scroll bar")
+                return
+            }
+
+            if jumpViaCLI(heading: heading, responseTerminalLines: responseTerminalLines, terminalType: terminalType) {
+                log("jumpToHeading: succeeded via CLI/IPC")
+                return
+            }
+
+            log("jumpToHeading: falling back to key simulation")
+            jumpViaKeySimulation(heading: heading, responseTerminalLines: responseTerminalLines, pid: pid)
         }
-
-        // Tier B: try CLI/IPC for terminals that support it
-        if jumpViaCLI(heading: heading, responseTerminalLines: responseTerminalLines, terminalType: terminalType) {
-            log("jumpToHeading: succeeded via CLI/IPC")
-            return
-        }
-
-        // Tier C: keyboard simulation fallback
-        log("jumpToHeading: falling back to key simulation")
-        jumpViaKeySimulation(heading: heading, responseTerminalLines: responseTerminalLines, pid: pid)
     }
 
     // MARK: - Tier A: AX Text Search + ScrollBar
@@ -214,11 +218,10 @@ enum TerminalAdapter {
                 Thread.sleep(forTimeInterval: 0.05)
             }
         }
-        guard let windowRef = windowRef else {
+        guard let window = axElement(from: windowRef) else {
             log("tierA: no windows found after retries")
             return false
         }
-        let window = windowRef as! AXUIElement
 
         guard let scrollArea = findAXElement(in: window, role: kAXScrollAreaRole as String) else {
             log("tierA: no AXScrollArea found")
@@ -253,7 +256,7 @@ enum TerminalAdapter {
            let line = (cursorLineRef as? NSNumber)?.intValue {
             totalLines = line
         } else {
-            let lastCharIndex = max(0, fullText.count - 1)
+            let lastCharIndex = max(0, fullText.utf16.count - 1)
             if let line = axLineForCharIndex(lastCharIndex, textArea: textArea) {
                 totalLines = line
                 log("tierA: used AXLineForIndex fallback for totalLines = \(line)")
@@ -268,9 +271,12 @@ enum TerminalAdapter {
         var visibleRows = 40
         var visRangeRef: CFTypeRef?
         if AXUIElementCopyAttributeValue(textArea, kAXVisibleCharacterRangeAttribute as CFString, &visRangeRef) == .success {
-            let visRange = visRangeRef as! AXValue
             var cfRange = CFRange(location: 0, length: 0)
-            AXValueGetValue(visRange, .cfRange, &cfRange)
+            guard let visRange = axValue(from: visRangeRef, type: .cfRange),
+                  AXValueGetValue(visRange, .cfRange, &cfRange) else {
+                log("tierA: failed to decode visible range")
+                return false
+            }
 
             var startLineRef: CFTypeRef?
             var endLineRef: CFTypeRef?
@@ -308,21 +314,56 @@ enum TerminalAdapter {
             return true  // AX worked, just nothing to scroll
         }
 
-        // Offset by 1 line so the heading appears near the top with just the blank line above
-        let scrollValue = Float(max(0, targetLine - 1)) / Float(maxScrollLine)
+        // Initial scroll: put the heading roughly at the viewport top
+        let scrollValue = Float(max(0, targetLine)) / Float(maxScrollLine)
         let clampedValue = min(max(scrollValue, 0.0), 1.0)
-        log("tierA: scrollValue = \(targetLine) / \(maxScrollLine) = \(clampedValue)")
+        log("tierA: initial scrollValue = \(targetLine) / \(maxScrollLine) = \(clampedValue)")
 
         var scrollBarRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(scrollArea, kAXVerticalScrollBarAttribute as CFString, &scrollBarRef) == .success else {
             log("tierA: no vertical scroll bar found")
             return false
         }
-        let scrollBar = scrollBarRef as! AXUIElement
+        guard let scrollBar = axElement(from: scrollBarRef) else {
+            log("tierA: vertical scroll bar had unexpected type")
+            return false
+        }
 
         let result = AXUIElementSetAttributeValue(scrollBar, kAXValueAttribute as CFString, NSNumber(value: clampedValue) as CFTypeRef)
         log("tierA: set scroll bar to \(clampedValue), result = \(result == .success ? "success" : "failed (\(result.rawValue))")")
-        return result == .success
+        guard result == .success else { return false }
+
+        // Verify and correct: read actual viewport position after scrolling.
+        // This eliminates dependence on font size, line spacing, and terminal-specific scroll mapping.
+        Thread.sleep(forTimeInterval: 0.05)
+        var verifyRangeRef: CFTypeRef?
+        let verifyRead = AXUIElementCopyAttributeValue(textArea, kAXVisibleCharacterRangeAttribute as CFString, &verifyRangeRef)
+        if verifyRead == .success {
+            var verifyCFRange = CFRange(location: 0, length: 0)
+            let verifyRangeVal = axValue(from: verifyRangeRef, type: .cfRange)
+            let gotValue = verifyRangeVal.map { AXValueGetValue($0, .cfRange, &verifyCFRange) } ?? false
+            let textLen = fullText.utf16.count
+            log("tierA: verify — visRange loc=\(verifyCFRange.location) len=\(verifyCFRange.length) textLen=\(textLen) gotValue=\(gotValue)")
+
+            if gotValue, verifyCFRange.length > 0, verifyCFRange.length < textLen,
+               let topVisibleLine = axLineForCharIndex(verifyCFRange.location, textArea: textArea) {
+                let headingOffsetFromTop = targetLine - topVisibleLine
+                let desiredOffset = 1
+                let correction = headingOffsetFromTop - desiredOffset
+                if correction != 0 {
+                    let correctedValue = clampedValue + Float(correction) / Float(maxScrollLine)
+                    let correctedClamped = min(max(correctedValue, 0.0), 1.0)
+                    log("tierA: verify — heading at line \(headingOffsetFromTop) from top, correcting by \(correction) → \(correctedClamped)")
+                    AXUIElementSetAttributeValue(scrollBar, kAXValueAttribute as CFString, NSNumber(value: correctedClamped) as CFTypeRef)
+                } else {
+                    log("tierA: verify — heading at line \(headingOffsetFromTop) from top, no correction needed")
+                }
+            }
+        } else {
+            log("tierA: verify — failed to read visible range: \(verifyRead.rawValue)")
+        }
+
+        return true
     }
 
     /// Search for a heading in the AX text buffer and return its exact line number.
@@ -371,7 +412,7 @@ enum TerminalAdapter {
                 strippedChars.append(ch)
                 indexMap.append(offset)
             }
-            offset += 1
+            offset += String(ch).utf16.count
         }
 
         let strippedHaystack = String(strippedChars)
@@ -396,7 +437,7 @@ enum TerminalAdapter {
                 break
             }
 
-            let matchOffset = text.distance(from: text.startIndex, to: range.lowerBound)
+            let matchOffset = utf16Offset(in: text, for: range.lowerBound)
 
             // Check if this match is on a standalone line:
             // everything between the previous \n and next \n should be whitespace + needle + whitespace
@@ -461,7 +502,7 @@ enum TerminalAdapter {
                 // Find the next newline after the separator
                 let afterSep = range.upperBound
                 if let nlRange = fullText.range(of: "\n", range: afterSep..<fullText.endIndex) {
-                    let charOffset = fullText.distance(from: fullText.startIndex, to: nlRange.upperBound)
+                    let charOffset = utf16Offset(in: fullText, for: nlRange.upperBound)
                     log("tierA/findResponseStart: found separator, response starts at char \(charOffset)")
                     return axLineForCharIndex(charOffset, textArea: textArea)
                 }
@@ -475,7 +516,7 @@ enum TerminalAdapter {
             if let range = fullText.range(of: "──────────", options: .backwards) {
                 let afterSep = range.upperBound
                 if let nlRange = fullText.range(of: "\n", range: afterSep..<fullText.endIndex) {
-                    let charOffset = fullText.distance(from: fullText.startIndex, to: nlRange.upperBound)
+                    let charOffset = utf16Offset(in: fullText, for: nlRange.upperBound)
                     return axLineForCharIndex(charOffset, textArea: textArea)
                 }
             }
@@ -686,15 +727,16 @@ enum TerminalAdapter {
         guard AXUIElementCopyAttributeValue(scrollArea, kAXVerticalScrollBarAttribute as CFString, &scrollBarRef) == .success else {
             return nil
         }
-        let scrollBar = scrollBarRef as! AXUIElement
+        guard let scrollBar = axElement(from: scrollBarRef) else {
+            return nil
+        }
 
         // Get scroll bar height
         var barSizeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(scrollBar, kAXSizeAttribute as CFString, &barSizeRef) == .success else {
             return nil
         }
-        var barSize = CGSize.zero
-        AXValueGetValue(barSizeRef as! AXValue, .cgSize, &barSize)
+        guard let barSize = cgSize(from: barSizeRef) else { return nil }
         guard barSize.height > 0 else { return nil }
 
         // Find AXValueIndicator child (the knob)
@@ -712,8 +754,7 @@ enum TerminalAdapter {
                 guard AXUIElementCopyAttributeValue(child, kAXSizeAttribute as CFString, &knobSizeRef) == .success else {
                     continue
                 }
-                var knobSize = CGSize.zero
-                AXValueGetValue(knobSizeRef as! AXValue, .cgSize, &knobSize)
+                guard let knobSize = cgSize(from: knobSizeRef) else { continue }
                 guard knobSize.height > 0 else { continue }
 
                 let proportion = Double(knobSize.height) / Double(barSize.height)
@@ -741,11 +782,10 @@ enum TerminalAdapter {
             var bounds1Ref: CFTypeRef?
             if AXUIElementCopyParameterizedAttributeValue(textArea, kAXBoundsForRangeParameterizedAttribute as CFString, range0Ref! as CFTypeRef, &bounds0Ref) == .success,
                AXUIElementCopyParameterizedAttributeValue(textArea, kAXBoundsForRangeParameterizedAttribute as CFString, range1Ref! as CFTypeRef, &bounds1Ref) == .success {
-                var rect0 = CGRect.zero
-                var rect1 = CGRect.zero
-                AXValueGetValue(bounds0Ref as! AXValue, .cgRect, &rect0)
-                AXValueGetValue(bounds1Ref as! AXValue, .cgRect, &rect1)
-                lineHeight = abs(rect1.origin.y - rect0.origin.y)
+                if let rect0 = cgRect(from: bounds0Ref),
+                   let rect1 = cgRect(from: bounds1Ref) {
+                    lineHeight = abs(rect1.origin.y - rect0.origin.y)
+                }
             }
         }
 
@@ -781,11 +821,10 @@ enum TerminalAdapter {
             if let r0 = axRange0, let r1 = axRange1,
                AXUIElementCopyParameterizedAttributeValue(textArea, kAXBoundsForRangeParameterizedAttribute as CFString, r0 as CFTypeRef, &b0Ref) == .success,
                AXUIElementCopyParameterizedAttributeValue(textArea, kAXBoundsForRangeParameterizedAttribute as CFString, r1 as CFTypeRef, &b1Ref) == .success {
-                var rect0 = CGRect.zero
-                var rect1 = CGRect.zero
-                AXValueGetValue(b0Ref as! AXValue, .cgRect, &rect0)
-                AXValueGetValue(b1Ref as! AXValue, .cgRect, &rect1)
-                lineHeight = abs(rect1.origin.y - rect0.origin.y)
+                if let rect0 = cgRect(from: b0Ref),
+                   let rect1 = cgRect(from: b1Ref) {
+                    lineHeight = abs(rect1.origin.y - rect0.origin.y)
+                }
             }
         }
 
@@ -800,8 +839,7 @@ enum TerminalAdapter {
             log("tierA/boundsFallback: failed to get scrollArea size")
             return nil
         }
-        var size = CGSize.zero
-        AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
+        guard let size = cgSize(from: sizeRef) else { return nil }
 
         let rows = Int(size.height / lineHeight)
         log("tierA/boundsFallback: lineHeight=\(lineHeight) scrollAreaHeight=\(size.height) → rows=\(rows)")
@@ -830,5 +868,35 @@ enum TerminalAdapter {
             }
         }
         return nil
+    }
+
+    private static func utf16Offset(in text: String, for index: String.Index) -> Int {
+        guard let utf16Index = index.samePosition(in: text.utf16) else { return 0 }
+        return text.utf16.distance(from: text.utf16.startIndex, to: utf16Index)
+    }
+
+    private static func axElement(from ref: CFTypeRef?) -> AXUIElement? {
+        guard let ref, CFGetTypeID(ref) == AXUIElementGetTypeID() else { return nil }
+        return unsafeDowncast(ref, to: AXUIElement.self)
+    }
+
+    private static func axValue(from ref: CFTypeRef?, type: AXValueType) -> AXValue? {
+        guard let ref, CFGetTypeID(ref) == AXValueGetTypeID() else { return nil }
+        let value = unsafeDowncast(ref, to: AXValue.self)
+        return AXValueGetType(value) == type ? value : nil
+    }
+
+    private static func cgSize(from ref: CFTypeRef?) -> CGSize? {
+        guard let value = axValue(from: ref, type: .cgSize) else { return nil }
+        var size = CGSize.zero
+        guard AXValueGetValue(value, .cgSize, &size) else { return nil }
+        return size
+    }
+
+    private static func cgRect(from ref: CFTypeRef?) -> CGRect? {
+        guard let value = axValue(from: ref, type: .cgRect) else { return nil }
+        var rect = CGRect.zero
+        guard AXValueGetValue(value, .cgRect, &rect) else { return nil }
+        return rect
     }
 }
