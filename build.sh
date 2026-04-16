@@ -175,11 +175,16 @@ if $NOTARIZE && [ -n "$SIGN_IDENTITY" ]; then
 fi
 
 # Create ZIP for auto-updater (from the already-signed/notarized app)
+# Strip xattr and resource forks so the ZIP doesn't break signature verification
 ZIP_PATH="${DMG_DIR}/TOC.for.Claude.Code.app.zip"
 rm -f "$ZIP_PATH"
-cd "$DMG_DIR"
-ditto -c -k --keepParent "${DISPLAY_NAME}.app" "$ZIP_PATH"
+ZIP_STAGING=$(mktemp -d)
+rsync -a --exclude '._*' "$APP_DIR" "$ZIP_STAGING/"
+xattr -cr "$ZIP_STAGING/${DISPLAY_NAME}.app"
+cd "$ZIP_STAGING"
+COPYFILE_DISABLE=1 ditto -c -k --norsrc --keepParent "${DISPLAY_NAME}.app" "$ZIP_PATH"
 cd "$SCRIPT_DIR"
+rm -rf "$ZIP_STAGING"
 
 echo ""
 echo "App: ${APP_DIR}"
