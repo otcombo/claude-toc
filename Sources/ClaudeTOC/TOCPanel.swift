@@ -187,10 +187,14 @@ class TOCSessionManager {
             windowObserver?.registerAXObserver(for: termApp)
         }
 
-        // Close existing panel for this session
-        sessions[sessionId]?.panel?.orderOut(nil)
-        sessions[sessionId]?.panel?.close()
-        sessions[sessionId]?.panel = nil
+        // Remove existing session entirely so updateVisiblePanels() won't
+        // recreate a panel with stale headings while the new data loads
+        if let oldSession = sessions.removeValue(forKey: sessionId) {
+            oldSession.panel?.orderOut(nil)
+            oldSession.panel?.close()
+            oldSession.panel = nil
+        }
+        onSessionsChanged?()
 
         pendingSessionLoads[sessionId]?.cancel()
         let loadToken = UUID()
