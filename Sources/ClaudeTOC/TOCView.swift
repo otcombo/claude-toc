@@ -43,13 +43,7 @@ struct TOCView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(headings.enumerated()), id: \.offset) { index, heading in
                         if index > 0 {
-                            // Same group (child follows parent, or sibling at deeper level): tight spacing
-                            // New group (same or shallower level as previous): wider spacing
-                            let prevLevel = headings[index - 1].level
-                            // Tight spacing within a group (child of parent, or siblings under same parent)
-                            // Wide spacing when a new top-level section starts (level goes same or shallower)
-                            let gap: CGFloat = heading.level > prevLevel || (heading.level == prevLevel && heading.level > minLevel) ? 0 : 8
-                            Spacer().frame(height: gap)
+                            Spacer().frame(height: gap(before: index))
                         }
                         headingRow(heading, index: index)
                     }
@@ -61,17 +55,37 @@ struct TOCView: View {
                 .background(HorizontalBounceFixer())
             }
             .frame(maxWidth: .infinity)
+            .frame(height: min(contentNaturalHeight, Self.maxScrollHeight), alignment: .top)
             .compatScrollBounce()
         }
         .frame(width: 180)
-        .fixedSize(horizontal: false, vertical: true)
-        .frame(maxHeight: 300)
         .padding(.bottom, 12)
         .adaptiveGlass(.panel, colorScheme: colorScheme)
     }
 
+    private static let maxScrollHeight: CGFloat = 300
+    private static let rowHeight: CGFloat = 20
+    private static let verticalPadding: CGFloat = 16
+
     private var minLevel: Int {
         headings.map(\.level).min() ?? 1
+    }
+
+    private func gap(before index: Int) -> CGFloat {
+        guard index > 0 else { return 0 }
+        let current = headings[index]
+        let prev = headings[index - 1]
+        return current.level > prev.level || (current.level == prev.level && current.level > minLevel) ? 0 : 8
+    }
+
+    /// Computed synchronously because NSHostingView.fittingSize reads size before
+    /// any PreferenceKey/GeometryReader callback would have fired.
+    private var contentNaturalHeight: CGFloat {
+        var h: CGFloat = Self.verticalPadding
+        for i in 0..<headings.count {
+            h += gap(before: i) + Self.rowHeight
+        }
+        return h
     }
 
     @ViewBuilder
