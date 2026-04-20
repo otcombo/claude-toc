@@ -18,6 +18,7 @@ class Updater {
     private(set) var isChecking = false
     private(set) var isUpdating = false
     private var checkFailed = false
+    private var checkStartTime: Date?
 
     private var updateWindow: NSWindow?
     private let viewState = UpdateViewState()
@@ -38,10 +39,13 @@ class Updater {
     // MARK: - Window
 
     func showUpdateWindow() {
-        if let existing = updateWindow, existing.isVisible {
-            existing.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
+        log("Updater: showUpdateWindow called, existing=\(updateWindow != nil), isVisible=\(updateWindow?.isVisible ?? false)")
+
+        // Always close stale window and create fresh — after sleep/wake the old
+        // window may report isVisible=true but fail to actually appear on screen.
+        if let existing = updateWindow {
+            existing.close()
+            updateWindow = nil
         }
 
         syncViewState()
@@ -98,8 +102,14 @@ class Updater {
     // MARK: - Check
 
     func checkForUpdate(silent: Bool = false) {
+        // Auto-expire stale check (e.g. network request lost during sleep/wake)
+        if isChecking, let start = checkStartTime, Date().timeIntervalSince(start) > 30 {
+            log("Updater: expiring stale check (started \(start))")
+            isChecking = false
+        }
         guard !isChecking else { return }
         isChecking = true
+        checkStartTime = Date()
         checkFailed = false
         onStatusChanged?()
         syncViewState()
