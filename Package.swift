@@ -8,9 +8,18 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "ClaudeTOC",
+            exclude: [
+                "TOC Icon.icon",
+                "appicon-1024x1024@1x.png",
+                "appicon64@3x.png",
+            ],
             linkerSettings: [
                 .unsafeFlags(["-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__info_plist", "-Xlinker", "Info.plist"], .when(platforms: [.macOS]))
             ]
+        ),
+        .testTarget(
+            name: "ClaudeTOCTests",
+            dependencies: ["ClaudeTOC"]
         ),
     ]
 )
