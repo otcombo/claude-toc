@@ -36,12 +36,20 @@ private func setSendTimeout(fd: Int32, seconds: Int) {
 }
 
 /// Bind a sockaddr_un to the given path
-private func makeUnixAddress() -> sockaddr_un {
+private func makeUnixAddress() -> sockaddr_un? {
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
-    withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-        socketPath.withCString { cstr in
-            _ = strcpy(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: CChar.self), cstr)
+    let maxPathLength = MemoryLayout.size(ofValue: addr.sun_path)
+    let utf8Bytes = Array(socketPath.utf8)
+    guard utf8Bytes.count < maxPathLength else {
+        log("SocketIPC: socket path too long (\(utf8Bytes.count) >= \(maxPathLength))")
+        return nil
+    }
+
+    withUnsafeMutableBytes(of: &addr.sun_path) { rawBuffer in
+        rawBuffer.initializeMemory(as: UInt8.self, repeating: 0)
+        for (index, byte) in utf8Bytes.enumerated() {
+            rawBuffer[index] = byte
         }
     }
     return addr
@@ -66,7 +74,7 @@ class SocketServer {
             return
         }
 
-        var addr = makeUnixAddress()
+        guard var addr = makeUnixAddress() else { return }
         let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
         let bindResult = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -142,7 +150,7 @@ enum SocketClient {
         setReceiveTimeout(fd: fd, seconds: socketTimeout)
         setSendTimeout(fd: fd, seconds: socketTimeout)
 
-        var addr = makeUnixAddress()
+        guard var addr = makeUnixAddress() else { return false }
         let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
         let connectResult = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {

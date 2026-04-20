@@ -197,9 +197,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Read existing settings or start fresh
         var settings: [String: Any] = [:]
-        if let data = try? Data(contentsOf: settingsURL),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            settings = json
+        if FileManager.default.fileExists(atPath: settingsURL.path) {
+            do {
+                let data = try Data(contentsOf: settingsURL)
+                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    log("Failed to parse Claude settings as JSON object: \(settingsURL.path)")
+                    return
+                }
+                settings = json
+            } catch {
+                log("Failed to read Claude settings: \(error)")
+                return
+            }
         }
 
         // Check existing Stop hooks — update stale path or add new
@@ -219,7 +228,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         stopHooks.append([
             "hooks": [[
                 "type": "command",
-                "command": "'\(hookPath)'"
+                "command": shellSingleQuoted(hookPath)
             ]]
         ])
 
@@ -236,6 +245,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             log("Failed to install hook: \(error)")
         }
     }
+}
+
+private func shellSingleQuoted(_ string: String) -> String {
+    "'\(string.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
 }
 
 let app = NSApplication.shared

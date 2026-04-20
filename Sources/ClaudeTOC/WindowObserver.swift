@@ -7,10 +7,11 @@ import Foundation
 class WindowObserver {
     weak var sessionManager: TOCSessionManager?
     private var axObservers: [pid_t: AXObserver] = [:]
+    private var axRunLoopSources: [pid_t: CFRunLoopSource] = [:]
     private var trackedWindows: [pid_t: AXUIElement] = [:]
     private var workspaceObservers: [NSObjectProtocol] = []
     private var pollTimer: Timer?
-    private var lastKnownWindowFrames: [pid_t: CGRect] = [:]
+    private var lastKnownWindowFrames: [String: CGRect] = [:]
     private var axTrusted = false
     /// Prevent premature deallocation while AXObserver callbacks hold a raw pointer to self.
     /// Incremented on first registerAXObserver, decremented when all observers are removed.
@@ -65,8 +66,12 @@ class WindowObserver {
                 AXObserverRemoveNotification(observer, window, kAXWindowMovedNotification as CFString)
                 AXObserverRemoveNotification(observer, window, kAXWindowResizedNotification as CFString)
             }
+            if let source = axRunLoopSources[pid] {
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
+            }
         }
         axObservers.removeAll()
+        axRunLoopSources.removeAll()
         trackedWindows.removeAll()
 
         // Release the safety retain now that all callbacks are removed
@@ -107,8 +112,10 @@ class WindowObserver {
         let refcon = Unmanaged.passUnretained(self).toOpaque()
 
         AXObserverAddNotification(observer, axApp, kAXFocusedWindowChangedNotification as CFString, refcon)
-        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        let runLoopSource = AXObserverGetRunLoopSource(observer)
+        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .defaultMode)
         axObservers[pid] = observer
+        axRunLoopSources[pid] = runLoopSource
 
         trackFocusedWindow(for: pid, observer: observer)
         log("WindowObserver: registered AXObserver for \(app.bundleIdentifier ?? "?") pid=\(pid)")
@@ -119,7 +126,10 @@ class WindowObserver {
         let axApp = AXUIElementCreateApplication(pid)
         AXObserverRemoveNotification(observer, axApp, kAXFocusedWindowChangedNotification as CFString)
         untrackWindow(for: pid, observer: observer)
-        lastKnownWindowFrames.removeValue(forKey: pid)
+        if let source = axRunLoopSources.removeValue(forKey: pid) {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
+        }
+        lastKnownWindowFrames.removeValue(forKey: "pid:\(pid)")
         log("WindowObserver: unregistered AXObserver for pid \(pid)")
 
         // Release the safety retain when no more AXObservers hold our pointer
@@ -138,7 +148,10 @@ class WindowObserver {
             log("WindowObserver: trackFocusedWindow — no focused window for pid \(pid)")
             return
         }
-        let window = windowRef as! AXUIElement
+        guard let window = axElement(from: windowRef) else {
+            log("WindowObserver: focused window had unexpected type for pid \(pid)")
+            return
+        }
         let refcon = Unmanaged.passUnretained(self).toOpaque()
 
         untrackWindow(for: pid, observer: observer)
@@ -177,23 +190,24 @@ class WindowObserver {
         for session in visibleSessions {
             guard let termApp = session.terminalApp else { continue }
             let pid = termApp.processIdentifier
+            let frameKey = session.windowID.map { "wid:\($0)" } ?? "pid:\(pid)"
 
-            // Find the first matching window for this terminal app
             for windowInfo in windowList {
                 guard let ownerPID = windowInfo[kCGWindowOwnerPID as String] as? Int32,
                       ownerPID == pid,
+                      matchesWindow(sessionWindowID: session.windowID, windowInfo: windowInfo),
                       let bounds = windowInfo[kCGWindowBounds as String] as? [String: CGFloat],
                       let x = bounds["X"], let y = bounds["Y"],
                       let w = bounds["Width"], let h = bounds["Height"],
                       w > 100, h > 100 else { continue }
 
                 let frame = CGRect(x: x, y: y, width: w, height: h)
-                if let lastFrame = lastKnownWindowFrames[pid], lastFrame == frame {
+                if let lastFrame = lastKnownWindowFrames[frameKey], lastFrame == frame {
                     break  // No change
                 }
 
                 // Window moved or resized
-                lastKnownWindowFrames[pid] = frame
+                lastKnownWindowFrames[frameKey] = frame
                 sm.repositionVisiblePanels()
                 break
             }
@@ -237,7 +251,15 @@ class WindowObserver {
         guard AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &windowRef) == .success else {
             return nil
         }
-        return (windowRef as! AXUIElement)
+        return axElement(from: windowRef)
+    }
+
+    private func matchesWindow(sessionWindowID: CGWindowID?, windowInfo: [String: Any]) -> Bool {
+        guard let sessionWindowID = sessionWindowID else { return true }
+        guard let windowNumber = windowInfo[kCGWindowNumber as String] as? UInt32 else {
+            return false
+        }
+        return CGWindowID(windowNumber) == sessionWindowID
     }
 }
 
@@ -252,9 +274,23 @@ private func axCallback(
     guard let refcon = refcon else { return }
     let windowObserver = Unmanaged<WindowObserver>.fromOpaque(refcon).takeUnretainedValue()
     let notifName = notification as String
-    DispatchQueue.main.async {
+
+    let deliver = {
         MainActor.assumeIsolated {
             windowObserver.handleAXNotificationByName(notifName)
         }
     }
+
+    if Thread.isMainThread {
+        deliver()
+    } else {
+        Task { @MainActor in
+            windowObserver.handleAXNotificationByName(notifName)
+        }
+    }
+}
+
+private func axElement(from ref: CFTypeRef?) -> AXUIElement? {
+    guard let ref, CFGetTypeID(ref) == AXUIElementGetTypeID() else { return nil }
+    return unsafeDowncast(ref, to: AXUIElement.self)
 }
