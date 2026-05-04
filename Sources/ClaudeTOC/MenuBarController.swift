@@ -128,10 +128,25 @@ class MenuBarController: NSObject {
 
         menu.addItem(.separator())
 
-        // Check for Updates (opens window)
-        let checkUpdate = NSMenuItem(title: "Check for Updates…", action: #selector(showUpdateWindow), keyEquivalent: "")
-        checkUpdate.target = self
-        menu.addItem(checkUpdate)
+        // Update status: surface availability so users with notifications off
+        // still see that an update is waiting.
+        if Updater.shared.isChecking {
+            let item = NSMenuItem(title: "Checking for Updates…", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        } else if Updater.shared.updateAvailable, let latest = Updater.shared.latestVersion {
+            let item = NSMenuItem(title: "Update to v\(latest)…", action: #selector(showUpdateWindow), keyEquivalent: "")
+            item.target = self
+            if let baseImage = NSImage(systemSymbolName: "arrow.up.circle.fill", accessibilityDescription: nil) {
+                let config = NSImage.SymbolConfiguration(paletteColors: [.systemBlue])
+                item.image = baseImage.withSymbolConfiguration(config)
+            }
+            menu.addItem(item)
+        } else {
+            let item = NSMenuItem(title: "Check for Updates…", action: #selector(showUpdateWindow), keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+        }
 
         menu.addItem(.separator())
 

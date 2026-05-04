@@ -214,10 +214,14 @@ class Updater {
                     let currentIdentifier = Bundle.main.bundleIdentifier ?? "com.otcombo.claudetoc"
 
                     DispatchQueue.global(qos: .userInitiated).async {
+                        // Read the running app's Team ID up-front so we can refuse any
+                        // downloaded app that wasn't signed by the same developer.
+                        let currentTeamIdentifier = Self.teamIdentifier(ofAppAt: URL(fileURLWithPath: currentBundle))
                         let result = Self.prepareInstall(
                             zipURL: tempURL,
                             currentAppBundlePath: currentBundle,
                             currentBundleIdentifier: currentIdentifier,
+                            currentTeamIdentifier: currentTeamIdentifier,
                             currentPID: currentPID
                         )
 
@@ -302,10 +306,16 @@ private extension Updater {
         zipURL: URL,
         currentAppBundlePath: String,
         currentBundleIdentifier: String,
+        currentTeamIdentifier: String?,
         currentPID: Int32
     ) -> UpdatePreparationResult {
         guard currentAppBundlePath.hasSuffix(".app") else {
             return .failure("Updater: not running from .app bundle, cannot update")
+        }
+        guard let currentTeamIdentifier, !currentTeamIdentifier.isEmpty else {
+            // Refuse to update if we can't read our own Team ID — without that
+            // anchor we can't tell a legitimate update from an attacker-signed app.
+            return .failure("Updater: unable to read running app's Team ID, refusing update")
         }
 
         let appURL = URL(fileURLWithPath: currentAppBundlePath)
@@ -336,7 +346,11 @@ private extension Updater {
             return .failure("Updater: no .app found in zip")
         }
 
-        guard verifyCodeSignature(appURL: newApp, expectedBundleIdentifier: currentBundleIdentifier) else {
+        guard verifyCodeSignature(
+            appURL: newApp,
+            expectedBundleIdentifier: currentBundleIdentifier,
+            expectedTeamIdentifier: currentTeamIdentifier
+        ) else {
             return .failure("Updater: downloaded app failed signature verification")
         }
 
@@ -362,7 +376,11 @@ private extension Updater {
         }
     }
 
-    nonisolated static func verifyCodeSignature(appURL: URL, expectedBundleIdentifier: String) -> Bool {
+    nonisolated static func verifyCodeSignature(
+        appURL: URL,
+        expectedBundleIdentifier: String,
+        expectedTeamIdentifier: String
+    ) -> Bool {
         let verify = Process()
         verify.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
         verify.arguments = ["--verify", "--deep", "--strict", appURL.path]
@@ -379,6 +397,53 @@ private extension Updater {
         guard verify.terminationStatus == 0 else { return false }
 
         let bundle = Bundle(url: appURL)
-        return bundle?.bundleIdentifier == expectedBundleIdentifier
+        guard bundle?.bundleIdentifier == expectedBundleIdentifier else {
+            log("Updater: bundle identifier mismatch")
+            return false
+        }
+
+        // Pin the developer: a valid Apple-signed app from a different developer
+        // (or an attacker with their own Developer ID) must not be accepted.
+        guard let newTeam = teamIdentifier(ofAppAt: appURL) else {
+            log("Updater: failed to read Team ID from downloaded app")
+            return false
+        }
+        guard newTeam == expectedTeamIdentifier else {
+            log("Updater: Team ID mismatch — expected \(expectedTeamIdentifier), got \(newTeam)")
+            return false
+        }
+        return true
+    }
+
+    /// Read TeamIdentifier from `codesign -dvv` stderr. Returns nil for ad-hoc
+    /// or unsigned apps (codesign reports "TeamIdentifier=not set").
+    nonisolated static func teamIdentifier(ofAppAt appURL: URL) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        process.arguments = ["-dvv", appURL.path]
+        let pipe = Pipe()
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = pipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+        guard process.terminationStatus == 0 else { return nil }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else { return nil }
+
+        let prefix = "TeamIdentifier="
+        for line in output.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix(prefix) {
+                let value = String(trimmed.dropFirst(prefix.count))
+                return (value.isEmpty || value == "not set") ? nil : value
+            }
+        }
+        return nil
     }
 }

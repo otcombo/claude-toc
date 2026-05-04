@@ -160,6 +160,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         sessionManager.windowObserver = windowObserver
         windowObserver.start()
 
+        // Auto-remove sessions whose terminal/Claude process is gone.
+        sessionManager.startCleanup()
+
         sessionManager.onSessionsChanged = { [weak self] in
             self?.menuBar.updateMenu()
         }
@@ -184,20 +187,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Install Claude Code Stop hook into ~/.claude/settings.json
+    /// Install Claude Code Stop hook into ~/.claude/settings.json.
+    /// Idempotent: leaves the file untouched when the desired entry is already present;
+    /// only strips ClaudeTOC entries whose hook.sh path no longer exists.
     private func installClaudeHookIfNeeded() {
         guard let hookScript = Bundle.main.url(forResource: "hook", withExtension: "sh") else {
             log("hook.sh not found in bundle")
             return
         }
         let hookPath = hookScript.path
+        let desiredCommand = shellSingleQuoted(hookPath)
 
-        let claudeDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
+        let fm = FileManager.default
+        let claudeDir = fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
         let settingsURL = claudeDir.appendingPathComponent("settings.json")
 
-        // Read existing settings or start fresh
         var settings: [String: Any] = [:]
-        if FileManager.default.fileExists(atPath: settingsURL.path) {
+        if fm.fileExists(atPath: settingsURL.path) {
             do {
                 let data = try Data(contentsOf: settingsURL)
                 guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -211,33 +217,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Check existing Stop hooks — update stale path or add new
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
         var stopHooks = hooks["Stop"] as? [[String: Any]] ?? []
+        let originalStopHooks = stopHooks
 
-        // Remove any existing ClaudeTOC hook entries (stale or current)
+        // Drop only stale ClaudeTOC entries (hook.sh path no longer exists).
+        // Preserves user customizations and entries pointing to a still-valid hook.sh
+        // (e.g. parallel dev/release installs).
         stopHooks.removeAll { entry in
             guard let innerHooks = entry["hooks"] as? [[String: Any]] else { return false }
             return innerHooks.contains { h in
-                guard let cmd = h["command"] as? String else { return false }
-                return cmd.contains("hook.sh") && (cmd.contains("ClaudeTOC") || cmd.contains("TOC for Claude Code") || cmd.contains("claude-toc"))
+                guard let cmd = h["command"] as? String,
+                      cmd.contains("hook.sh"),
+                      cmd.contains("ClaudeTOC") || cmd.contains("TOC for Claude Code") || cmd.contains("claude-toc")
+                else { return false }
+                let path = unquoteShellSingleQuoted(cmd) ?? cmd
+                return !fm.fileExists(atPath: path)
             }
         }
 
-        // Add fresh entry with correct path
-        stopHooks.append([
-            "hooks": [[
-                "type": "command",
-                "command": shellSingleQuoted(hookPath)
-            ]]
-        ])
+        // Already installed (against current hook path)? Don't rewrite the file.
+        let alreadyInstalled = stopHooks.contains { entry in
+            guard let innerHooks = entry["hooks"] as? [[String: Any]] else { return false }
+            return innerHooks.contains { ($0["command"] as? String) == desiredCommand }
+        }
+
+        if alreadyInstalled, stopHooks.count == originalStopHooks.count {
+            return
+        }
+
+        if !alreadyInstalled {
+            stopHooks.append([
+                "hooks": [[
+                    "type": "command",
+                    "command": desiredCommand
+                ]]
+            ])
+        }
 
         hooks["Stop"] = stopHooks
         settings["hooks"] = hooks
 
-        // Write back
         do {
-            try FileManager.default.createDirectory(at: claudeDir, withIntermediateDirectories: true)
+            try fm.createDirectory(at: claudeDir, withIntermediateDirectories: true)
             let data = try JSONSerialization.data(withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])
             try data.write(to: settingsURL, options: .atomic)
             log("Installed Claude Code Stop hook: \(hookPath)")
@@ -245,6 +267,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             log("Failed to install hook: \(error)")
         }
     }
+}
+
+/// Reverse of shellSingleQuoted: extract the path from a single-quoted shell command.
+/// Returns nil if `command` doesn't look like a single-quoted form.
+private func unquoteShellSingleQuoted(_ command: String) -> String? {
+    guard command.hasPrefix("'"), command.hasSuffix("'"), command.count >= 2 else { return nil }
+    let inner = String(command.dropFirst().dropLast())
+    return inner.replacingOccurrences(of: "'\"'\"'", with: "'")
 }
 
 private func shellSingleQuoted(_ string: String) -> String {

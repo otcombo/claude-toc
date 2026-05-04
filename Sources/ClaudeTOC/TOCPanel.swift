@@ -90,10 +90,17 @@ class TOCSession {
     var windowID: CGWindowID?        // stable window identifier for matching
     var panel: TOCPanel?
     var isPanelDismissed = false
+    /// PID of the Claude Code process (hook.sh's $PPID). Used by the cleanup
+    /// poll to drop the session when Claude exits (Ctrl+C, /quit, etc.).
+    let claudePid: Int32?
+    /// Wall-clock time the session was finalized — used by cleanup as a grace
+    /// period against false positives on freshly-created sessions.
+    let createdAt: Date
 
     init(id: String, transcriptPath: String, projectName: String?, tocResult: TOCResult?,
          terminalType: TerminalType, terminalApp: NSRunningApplication?,
-         terminalRows: Int? = nil, axWindow: AXUIElement? = nil, windowID: CGWindowID? = nil) {
+         terminalRows: Int? = nil, axWindow: AXUIElement? = nil, windowID: CGWindowID? = nil,
+         claudePid: Int32? = nil, createdAt: Date = Date()) {
         self.id = id
         self.transcriptPath = transcriptPath
         self.projectName = projectName
@@ -103,6 +110,8 @@ class TOCSession {
         self.terminalRows = terminalRows
         self.axWindow = axWindow
         self.windowID = windowID
+        self.claudePid = claudePid
+        self.createdAt = createdAt
     }
 
     var menuTitle: String {
@@ -129,6 +138,87 @@ class TOCSessionManager {
     var onSessionsChanged: (() -> Void)?
     var windowObserver: WindowObserver?
     private var notificationAuthorized = false
+    private var cleanupTimer: Timer?
+    private var terminationObserver: NSObjectProtocol?
+
+    /// Wire up automatic session cleanup:
+    ///   - Terminal app quit → drop its sessions immediately (NSWorkspace event)
+    ///   - 5 s poll for window-closed / Claude-PID-dead / transcript-deleted
+    func startCleanup() {
+        let nc = NSWorkspace.shared.notificationCenter
+        terminationObserver = nc.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification,
+            object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            MainActor.assumeIsolated {
+                self?.removeSessions(forTerminalPid: app.processIdentifier)
+            }
+        }
+
+        cleanupTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.cleanupStaleSessions()
+            }
+        }
+    }
+
+    private func removeSessions(forTerminalPid pid: pid_t) {
+        let toRemove = sessions.values.filter { $0.terminalApp?.processIdentifier == pid }.map(\.id)
+        for id in toRemove {
+            log("Cleanup: terminal pid=\(pid) terminated, removing session \(id)")
+            removeSession(id: id)
+        }
+    }
+
+    /// Test hook: bypass the load task and inject a TOCSession directly.
+    func _testInsertSession(_ session: TOCSession) {
+        sessions[session.id] = session
+        onSessionsChanged?()
+    }
+
+    func cleanupStaleSessions() {
+        guard !sessions.isEmpty else { return }
+
+        let runningPids = Set(NSWorkspace.shared.runningApplications.map(\.processIdentifier))
+        // Drop the OnScreen filter so minimized terminal windows still count as alive.
+        let openWindowIDs: Set<CGWindowID> = {
+            let list = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+            return Set(list.compactMap { ($0[kCGWindowNumber as String] as? UInt32).map { CGWindowID($0) } })
+        }()
+        let fm = FileManager.default
+        let now = Date()
+        // Skip very fresh sessions: between hook firing and finalize, transient
+        // races (PID not yet visible to runningApplications, window not yet in
+        // CGWindowList) would otherwise produce false positives.
+        let gracePeriod: TimeInterval = 2.0
+
+        var staleIds: [String] = []
+        for session in sessions.values {
+            guard now.timeIntervalSince(session.createdAt) > gracePeriod else { continue }
+
+            if let pid = session.terminalApp?.processIdentifier, !runningPids.contains(pid) {
+                log("Cleanup: terminal app pid=\(pid) gone, removing session \(session.id)")
+                staleIds.append(session.id); continue
+            }
+            if let wid = session.windowID, !openWindowIDs.contains(wid) {
+                log("Cleanup: window \(wid) closed, removing session \(session.id)")
+                staleIds.append(session.id); continue
+            }
+            if let cpid = session.claudePid, kill(cpid, 0) != 0 {
+                log("Cleanup: Claude pid=\(cpid) gone, removing session \(session.id)")
+                staleIds.append(session.id); continue
+            }
+            if !fm.fileExists(atPath: session.transcriptPath) {
+                log("Cleanup: transcript missing, removing session \(session.id)")
+                staleIds.append(session.id); continue
+            }
+        }
+
+        for id in staleIds {
+            removeSession(id: id)
+        }
+    }
 
     /// Request notification authorization once at startup
     func requestNotificationAuthorization() {
@@ -187,14 +277,10 @@ class TOCSessionManager {
             windowObserver?.registerAXObserver(for: termApp)
         }
 
-        // Remove existing session entirely so updateVisiblePanels() won't
-        // recreate a panel with stale headings while the new data loads
-        if let oldSession = sessions.removeValue(forKey: sessionId) {
-            oldSession.panel?.orderOut(nil)
-            oldSession.panel?.close()
-            oldSession.panel = nil
-        }
-        onSessionsChanged?()
+        // Keep the previous session/panel intact while the load task retries.
+        // finalizeSession will swap the panel's content atomically once the new
+        // transcript is ready — avoids a 0–3 s blank period that the old
+        // tear-down-then-rebuild flow caused.
 
         pendingSessionLoads[sessionId]?.cancel()
         let loadToken = UUID()
@@ -236,7 +322,8 @@ class TOCSessionManager {
                             sessionId: sessionId, transcriptPath: transcriptPath,
                             projectName: projectName, tocResult: snapshot?.tocResult,
                             terminalType: terminalType, terminalApp: terminalApp,
-                            terminalRows: terminalRows, axWindow: axWindow, windowID: windowID
+                            terminalRows: terminalRows, axWindow: axWindow, windowID: windowID,
+                            claudePid: hookPid
                         )
                     }
                     return
@@ -252,7 +339,8 @@ class TOCSessionManager {
                     sessionId: sessionId, transcriptPath: transcriptPath,
                     projectName: projectName, tocResult: latestSnapshot?.tocResult,
                     terminalType: terminalType, terminalApp: terminalApp,
-                    terminalRows: terminalRows, axWindow: axWindow, windowID: windowID
+                    terminalRows: terminalRows, axWindow: axWindow, windowID: windowID,
+                    claudePid: hookPid
                 )
             }
         }
@@ -264,25 +352,49 @@ class TOCSessionManager {
         sessionId: String, transcriptPath: String, projectName: String?,
         tocResult: TOCResult?, terminalType: TerminalType,
         terminalApp: NSRunningApplication?, terminalRows: Int? = nil,
-        axWindow: AXUIElement?, windowID: CGWindowID?
+        axWindow: AXUIElement?, windowID: CGWindowID?,
+        claudePid: Int32? = nil
     ) {
-        // Close existing panel for this session
-        sessions[sessionId]?.panel?.orderOut(nil)
-        sessions[sessionId]?.panel?.close()
-        sessions[sessionId]?.panel = nil
+        // Hold a local reference to the previous panel so it survives the dict
+        // assignment below — otherwise the old TOCSession gets dropped and ARC
+        // would close the panel along with it.
+        let oldPanel = sessions[sessionId]?.panel
 
         let session = TOCSession(
             id: sessionId, transcriptPath: transcriptPath, projectName: projectName,
             tocResult: tocResult, terminalType: terminalType, terminalApp: terminalApp,
-            terminalRows: terminalRows, axWindow: axWindow, windowID: windowID
+            terminalRows: terminalRows, axWindow: axWindow, windowID: windowID,
+            claudePid: claudePid
         )
 
         sessions[sessionId] = session
         log("SessionManager: session \(sessionId) finalized, windowID=\(windowID.map(String.init) ?? "nil"), headings=\(tocResult?.headings.count ?? 0), total sessions: \(sessions.count)")
 
-        // Only send notification if the terminal is not in the foreground
-        let terminalIsActive = NSWorkspace.shared.frontmostApplication?.processIdentifier == session.terminalApp?.processIdentifier
         let hasHeadings = tocResult?.headings.isEmpty == false
+
+        // Reuse the existing panel if we have one — swap its content view so
+        // the user sees an atomic update instead of a flash of empty space.
+        if hasHeadings, let panel = oldPanel, let tocResult = tocResult {
+            let hostingView = TOCHostingView(rootView: TOCView(
+                headings: tocResult.headings,
+                totalLines: tocResult.totalLines,
+                onHeadingClick: { [weak self] heading in
+                    self?.handleHeadingClick(heading, sessionId: sessionId)
+                },
+                onDismiss: { [weak self] in
+                    self?.hideSession(id: sessionId)
+                }
+            ))
+            panel.contentView = hostingView
+            let fitting = hostingView.fittingSize
+            panel.setFrame(NSRect(origin: panel.frame.origin, size: fitting), display: true)
+            session.panel = panel
+        } else if !hasHeadings, let panel = oldPanel {
+            panel.orderOut(nil)
+            panel.close()
+        }
+
+        let terminalIsActive = NSWorkspace.shared.frontmostApplication?.processIdentifier == session.terminalApp?.processIdentifier
 
         if hasHeadings && terminalIsActive {
             showPanel(for: session)
